@@ -39,6 +39,10 @@ import {
 import { selectBackend, usesCascadeFlow } from '../backend-router.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import { registerSseController } from '../sse-registry.js';
+import { prepareHermesDevinRequest } from '../hermes-devin/adapter.js';
+import { buildAdapterErrorResponse } from '../hermes-devin/errors.js';
+import { buildHermesDevinToolGateway } from '../hermes-devin/tool-gateway.js';
+import { executeHermesDevinAcpChat, shouldUseHermesDevinAcpBackend } from '../hermes-devin/acp-backend.js';
 import {
   recordNativeBridgeAccountGateReject,
   recordNativeBridgeAccountGateSkip,
@@ -77,7 +81,14 @@ const IP_RATE_LIMIT_BURST_FLOOR_MS = 30_000;
 export function shouldRouteGetChatMessageTools({ env = process.env, modelKey = '', tools } = {}) {
   if (!env || env.WINDSURFAPI_GETCHATMESSAGE_TOOLS !== '1') return false;
   if (!Array.isArray(tools) || tools.length === 0) return false;
-  return supportsToolCalls(modelKey);
+  if (!supportsToolCalls(modelKey)) return false;
+  // supportsToolCalls only checks for a modelUid, which deprecated and
+  // special-agent models (adaptive, arena-fast, arena-smart) also carry. The
+  // cloud ApiServerService does not treat those as tool-capable inference
+  // endpoints — they have their own routing — so exclude them here.
+  const info = getModelInfo(modelKey);
+  if (info && (info.deprecated || info.backend === 'special_agent')) return false;
+  return true;
 }
 
 /**
@@ -89,14 +100,28 @@ export function shouldRouteGetChatMessageTools({ env = process.env, modelKey = '
  * @param {object} parsed { text, stopReason, toolCalls, openaiToolCalls }
  * @returns {object} OpenAI choice
  */
-export function mapGetChatMessageResultToChoice(parsed) {
-  const openaiToolCalls = Array.isArray(parsed.openaiToolCalls) && parsed.openaiToolCalls.length
-    ? parsed.openaiToolCalls
-    : (parsed.toolCalls || []).map((tc, i) => ({
-        id: tc.id || `call_${i}`,
-        type: 'function',
-        function: { name: tc.name, arguments: tc.argumentsJson || '{}' },
+export function mapGetChatMessageResultToChoice(parsed, tools) {
+  // Normalize to the raw {id,name,argumentsJson} shape the guards operate on,
+  // whether the parser handed us raw toolCalls or pre-built openaiToolCalls.
+  const rawCalls = (Array.isArray(parsed.toolCalls) && parsed.toolCalls.length)
+    ? parsed.toolCalls
+    : (parsed.openaiToolCalls || []).map(tc => ({
+        id: tc.id,
+        name: tc.function?.name,
+        argumentsJson: tc.function?.arguments,
       }));
+  // Apply the SAME anti-fabrication + path-sanitize guards as every other
+  // tool-call surface in this file: drop calls for tools the caller never
+  // declared (server hallucination / prompt injection), and strip internal
+  // workspace paths from arguments. Only enforce the allowlist when the caller
+  // passed a tools[] array.
+  const allowed = Array.isArray(tools) ? filterToolCallsByAllowlist(rawCalls, tools) : rawCalls;
+  const safeCalls = allowed.map(sanitizeToolCall);
+  const openaiToolCalls = safeCalls.map((tc, i) => ({
+    id: tc.id || `call_${i}`,
+    type: 'function',
+    function: { name: tc.name, arguments: tc.argumentsJson || '{}' },
+  }));
 
   const hasToolCalls = openaiToolCalls.length > 0;
   const isToolUse = parsed.stopReason === 10 || hasToolCalls;
@@ -203,11 +228,17 @@ export function buildToolRoutingPlan(tools, { useCascade = false, modelKey = '',
   const { partition, ...nativeDecisionSummary } = nativeDecision;
   const nativeBridgeOn = !!nativeDecision.enabled;
   const emulationTools = nativeBridgeOn ? partition.unmapped : (tools || []);
+  const hermesDevinGateway = buildHermesDevinToolGateway(tools || [], {
+    nativeToolNames: nativeBridgeOn
+      ? partition.mapped.map(t => t?.function?.name).filter(Boolean)
+      : [],
+  });
   return {
     hasTools,
     partition,
     nativeBridgeOn,
     nativeDecision: nativeDecisionSummary,
+    hermesDevinGateway,
     emulationTools,
     nativeCallerTools: nativeBridgeOn ? partition.mapped : [],
     shouldBuildToolPreamble: Array.isArray(emulationTools) && emulationTools.length > 0,
@@ -320,6 +351,7 @@ export function summarizeToolRoutingDiagnostics({ tools, effectiveTools, toolCho
     unmapped: toolNameList(toolRouting?.partition?.unmapped || []),
     nativeBridgeOn: !!toolRouting?.nativeBridgeOn,
     nativeDecisionReason: toolRouting?.nativeDecision?.reason || '',
+    gateway: toolRouting?.hermesDevinGateway?.summary || null,
     preambleTier: preambleBudget?.tier || null,
     preambleBytes: preambleBudget?.finalBytes ?? null,
     forcedName,
@@ -344,6 +376,13 @@ function bridgeResultList(values) {
     .map(v => String(v || '').replace(/[\r\n\t]/g, ' ').trim().slice(0, 80))
     .filter(Boolean);
   return [...new Set(list)].slice(0, 50).join(',') || 'none';
+}
+
+
+function looksLikeNarratedToolIntent(text) {
+  if (typeof text !== 'string' || !text.trim()) return false;
+  return /(?:\b(?:I'?ll|I will|Let me|I'?m going to|I should|I need to|The user wants me to)\b|(?:我会|我将|让我|需要|应该)).{0,120}\b(?:call|use|invoke|run|execute|read|search|write|edit|list)\b/i.test(text)
+    || /(?:调用|使用|运行|执行|读取|搜索|写入|编辑|列出)/i.test(text);
 }
 
 function logBridgeResultDiagnostics(reqId, diag) {
@@ -397,6 +436,92 @@ export function finishPartialStreamAfterError({ id, created, model, send, res })
     });
   }
   if (res && !res.writableEnded) res.write('data: [DONE]\n\n');
+}
+
+function wrapNonStreamCompletionAsSse(result) {
+  const body = result?.body || {};
+  const choice = body.choices?.[0] || {};
+  const message = choice.message || {};
+  const content = typeof message.content === 'string' ? message.content : '';
+  const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : '';
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  return {
+    status: 200,
+    stream: true,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    },
+    async handler(res) {
+      const send = (data) => {
+        if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
+      send({
+        id: body.id,
+        object: 'chat.completion.chunk',
+        created: body.created,
+        model: body.model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }],
+      });
+      if (reasoning) {
+        send({
+          id: body.id,
+          object: 'chat.completion.chunk',
+          created: body.created,
+          model: body.model,
+          choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }],
+        });
+      }
+      if (content) {
+        send({
+          id: body.id,
+          object: 'chat.completion.chunk',
+          created: body.created,
+          model: body.model,
+          choices: [{ index: 0, delta: { content }, finish_reason: null }],
+        });
+      }
+      if (toolCalls.length) {
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i];
+          send({
+            id: body.id,
+            object: 'chat.completion.chunk',
+            created: body.created,
+            model: body.model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: i,
+                  id: tc.id,
+                  type: tc.type || 'function',
+                  function: {
+                    name: tc.function?.name || '',
+                    arguments: tc.function?.arguments || '',
+                  },
+                }],
+              },
+              finish_reason: null,
+            }],
+          });
+        }
+      }
+      send({
+        id: body.id,
+        object: 'chat.completion.chunk',
+        created: body.created,
+        model: body.model,
+        choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason || (toolCalls.length ? 'tool_calls' : 'stop') }],
+      });
+      if (!res.writableEnded) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    },
+  };
 }
 
 /**
@@ -1709,7 +1834,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // defaults OFF so the legacy path below is byte-identical to today. A
   // context.__nativeToolsTransport hook lets tests inject a mock transport.
   {
-    const nativeRouteModelKey = resolveModel(reqModel);
+    // Resolve the thinking variant here too (resolveEffectiveModelKey is not
+    // applied until later in the handler); otherwise a tools[] + thinking
+    // request would fire the native transport with the non-thinking uid and
+    // silently drop the thinking instruction.
+    const nativeRouteModelKey = resolveEffectiveModelKey(resolveModel(reqModel), isThinkingRequested(body));
     if (shouldRouteGetChatMessageTools({ env: process.env, modelKey: nativeRouteModelKey, tools: effectiveTools })) {
       const transport = context.__nativeToolsTransport || getChatMessageWithTools;
       const acquireFn = context.getApiKey || getApiKey;
@@ -1718,6 +1847,23 @@ async function _handleChatCompletionsInner(body, context = {}) {
       const triedNative = [];
       let nativeAcct = acquireFn(triedNative, nativeRouteModelKey, callerKey);
       if (!nativeAcct) {
+        // Fail fast on a known cooldown rather than spinning in the account
+        // wait loop (which re-logs the sticky check every iteration) and then
+        // falling through to legacy emulation. The flag opts the caller into
+        // native-only, so return the same clean 429 shape the legacy path uses.
+        const tempUnavail = isAllTemporarilyUnavailable(nativeRouteModelKey);
+        if (tempUnavail.allUnavailable) {
+          const retryAfterSec = Math.ceil(tempUnavail.retryAfterMs / 1000);
+          log.info(`Chat[${reqId}]: native route — all accounts temporarily unavailable for ${nativeRouteModelKey}, 429 (retry ${retryAfterSec}s)`);
+          return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${reqModel} 所有账号暂时不可用，请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: tempUnavail.retryAfterMs } } };
+        }
+        const rlNative = isAllRateLimited(nativeRouteModelKey);
+        if (rlNative.allLimited) {
+          const retryAfterSec = Math.ceil(rlNative.retryAfterMs / 1000);
+          log.info(`Chat[${reqId}]: native route — all accounts rate-limited for ${nativeRouteModelKey}, 429 (retry ${retryAfterSec}s)`);
+          return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${reqModel} 所有账号均已达速率限制，请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rlNative.retryAfterMs } } };
+        }
+        // Not a cooldown — an account may free up shortly; wait once.
         nativeAcct = await waitForAccountFn(triedNative, context.signal, undefined, nativeRouteModelKey, callerKey);
       }
       if (nativeAcct) {
@@ -1730,10 +1876,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
             completionConfig: max_tokens ? { maxTokens: max_tokens } : undefined,
             signal: context.signal,
           });
-          const choice = mapGetChatMessageResultToChoice(parsed);
+          const choice = mapGetChatMessageResultToChoice(parsed, effectiveTools);
           try { reportSuccess(nativeAcct.apiKey); } catch {}
           log.info(`Chat[${reqId}]: native GetChatMessage tool route model=${nativeRouteModelKey} stop=${parsed.stopReason} toolCalls=${parsed.toolCalls?.length || 0}`);
-          return {
+          const nativeResult = {
             status: 200,
             body: {
               id: `chatcmpl-${reqId}${Math.random().toString(36).slice(2, 8)}`,
@@ -1744,10 +1890,31 @@ async function _handleChatCompletionsInner(body, context = {}) {
               usage: buildUsageBody(null, messages, choice.message.content || ''),
             },
           };
+          // Honor the client's stream flag. Agents (Hermes) send stream:true and
+          // expect text/event-stream; returning a plain JSON body violates the
+          // SSE contract, breaks their client, and trips fallback_providers off
+          // glm-5.2. wrapNonStreamCompletionAsSse emits chat.completion.chunk
+          // frames (content + tool_calls deltas) and a final [DONE].
+          return stream ? wrapNonStreamCompletionAsSse(nativeResult) : nativeResult;
         } catch (err) {
           // Surface a clean upstream error; do NOT fall through to the legacy
           // emulation path (the flag opts the caller into native-only).
           log.warn(`Chat[${reqId}]: native GetChatMessage tool route failed: ${err.message}`);
+          // Classify the failure before touching account health. A model-side
+          // error TRAILER (e.g. "third-party model provider is experiencing
+          // issues") is a TRANSIENT upstream/model blip, NOT this account being
+          // unhealthy or rate-limited — penalizing it (reportInternalError)
+          // wrongly drives the whole pool into a cooldown, which then trips
+          // Hermes' fallback_providers off glm-5.2. Only a real 429 (we are
+          // actually being rate-limited) or an auth failure should affect pool
+          // health; a transient trailer is just a retryable error.
+          const isUpstreamModelTrailer = !!err?.errorTrailer;
+          try {
+            if (err?.status === 429) markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || 60000, nativeRouteModelKey);
+            else if (err?.status === 401 || err?.status === 403) reportError(nativeAcct.apiKey);
+            else if (!isUpstreamModelTrailer && (!err?.status || err.status >= 500)) reportInternalError(nativeAcct.apiKey);
+            // else: transient upstream model trailer — retryable, no penalty.
+          } catch {}
           const status = err?.status === 429 ? 429 : (err?.status && err.status >= 400 && err.status < 500 ? err.status : 502);
           return {
             status,
@@ -1757,8 +1924,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
           try { releaseAccount(nativeAcct.apiKey); } catch {}
         }
       }
-      // No account available — fall through to the legacy machinery below,
-      // which has its own exhaustion/queueing handling.
+      // Still no account and not a known cooldown: return a clean exhaustion
+      // error instead of silently downgrading to the legacy emulation path
+      // (the flag opts the caller into native-only).
+      log.info(`Chat[${reqId}]: native route — no accounts available for ${nativeRouteModelKey}, 503 (pool exhausted)`);
+      return { status: 503, body: { error: { message: 'No active accounts available for the native tool transport', type: 'pool_exhausted' } } };
     }
   }
 
@@ -1907,6 +2077,20 @@ async function _handleChatCompletionsInner(body, context = {}) {
     }
   }
 
+  const hermesDevinPrepared = prepareHermesDevinRequest({
+    requestId: reqId,
+    model: routingModelKey,
+    provider: modelInfo?.provider || null,
+    messages,
+    tools: effectiveTools,
+    stream: !!stream,
+    displayModel,
+  });
+  if (!hermesDevinPrepared.ok) {
+    log.info(`CompatBudget[${reqId}]: action=reject model=${routingModelKey} reason=${hermesDevinPrepared.response.body.error.code}`);
+    return hermesDevinPrepared.response;
+  }
+
   // Backend selection is centralized in backend-router.selectBackend(). This
   // is behaviour-preserving: special_agent → special-agent handler; otherwise
   // useCascade mirrors the legacy `!!(modelUid || modelEnum)`. The router gives
@@ -1998,6 +2182,33 @@ async function _handleChatCompletionsInner(body, context = {}) {
     });
     log.info(`Chat[${reqId}]: native bridge ON — model=${routingModelKey} mapped=[${mappedNames}] unmapped=[${unmappedNames}] allowlist=${nativeAllowlist.join(',')} additional_steps=${nativeAdditionalSteps.length}`);
   }
+  if (shouldUseHermesDevinAcpBackend(body, context.hermesDevinAcp?.env || process.env)) {
+    const acct = await waitForAccountFn(new Set(), null, QUEUE_MAX_WAIT_MS, routingModelKey, callerKey);
+    if (!acct) {
+      return {
+        status: 503,
+        body: { error: { message: 'Hermes Devin ACP backend could not acquire an upstream account.', type: 'backend_unavailable', code: 'acp_account_unavailable' } },
+      };
+    }
+    try {
+      return await executeHermesDevinAcpChat({
+        ...body,
+        id: genId(),
+        created: Math.floor(Date.now() / 1000),
+        model: displayModel,
+        modelKey: routingModelKey,
+        messages,
+        tools: effectiveTools,
+        account: acct,
+        env: context.hermesDevinAcp?.env || process.env,
+      }, {
+        runAcp: context.hermesDevinAcp?.runAcp,
+      });
+    } finally {
+      if (!context.waitForAccount) releaseAccount(acct.apiKey);
+    }
+  }
+
   if (nativeBridgeOn && hasNativeBridgeAccountGate()) {
     const hasAllowedAccount = getAccountList()
       .some(a => a.status === 'active' && isNativeBridgeAccountAllowed(a));
@@ -2270,9 +2481,14 @@ async function _handleChatCompletionsInner(body, context = {}) {
 
   const chatId = genId();
   const created = Math.floor(Date.now() / 1000);
-  const ckey = cacheKey(body, callerKey);
+  const ckey = emulateTools ? null : cacheKey(body, callerKey);
 
-  if (stream) {
+  const forcedFragileNonStream = stream && emulateTools && hasTools && hermesDevinPrepared.modelPolicy.adapterMode === 'fragile_tools';
+  if (forcedFragileNonStream) {
+    log.info(`Chat[${reqId}]: strict adapter forcing non-stream response for fragile emulated tool request so adapter_error can be returned before streaming commits`);
+  }
+
+  if (stream && !forcedFragileNonStream) {
     return streamResponse(
       chatId,
       created,
@@ -2528,7 +2744,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // re-burning the rate-limit + fallback cycle.
       reqId,
       context.__originalCkey || null,
+      hermesDevinPrepared.modelPolicy.adapterMode === 'fragile_tools',
     );
+    if (forcedFragileNonStream && result.status === 200) return wrapNonStreamCompletionAsSse(result);
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
     if (result.reuseEntryInvalid) reuseEntryDead = true;
@@ -2686,7 +2904,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null, fragileModel = false) {
   const startTime = Date.now();
   const nativeBridgeOn = !!nativeOpts?.enabled;
   try {
@@ -2840,6 +3058,11 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         // allText (line ~2155 below) happens after this; we use the
         // combined source proactively.
         const narrativeSource = (allText && allText.trim()) ? allText : allThinking;
+        const nluRetryEnabled = process.env.WINDSURFAPI_NLU_RETRY !== '0'
+          && (process.env.WINDSURFAPI_NLU_RETRY === '1'
+              || /zhipu|glm|moonshot|kimi/i.test(String(provider || ''))
+              || /^(?:glm|kimi)/i.test(String(modelKey || '')));
+        let nluRetryAttempted = false;
         if (toolCalls.length === 0 && narrativeSource) {
           const markers = [];
           if (/<tool_call/i.test(narrativeSource)) markers.push('xml_tag');
@@ -2861,7 +3084,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           // call but the surrounding narrative held everything NLU
           // needs. Restricting NLU to markers=none meant those cases
           // got 0 tool_calls back.
-          if (Array.isArray(tools) && tools.length > 0) {
+          if (false && Array.isArray(tools) && tools.length > 0) {
             const lastUser = latestRealUserText(messages) || '';
             const recovered = extractIntentFromNarrative(narrativeSource, tools, { lastUserText: lastUser, markers });
             if (recovered.length) {
@@ -2895,10 +3118,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           // tools on first pass). Claude/GPT have good first-pass compliance
           // so they only get retry when explicitly opted in. Set
           // WINDSURFAPI_NLU_RETRY=0 to disable globally.
-          const nluRetryEnabled = process.env.WINDSURFAPI_NLU_RETRY !== '0'
-            && (process.env.WINDSURFAPI_NLU_RETRY === '1'
-                || /zhipu|glm|moonshot|kimi/i.test(String(provider || ''))
-                || /^(?:glm|kimi)/i.test(String(modelKey || '')));
           if (toolCalls.length === 0
               && nluRetryEnabled
               && Array.isArray(tools) && tools.length > 0
@@ -2906,6 +3125,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
             const lastUser = latestRealUserText(messages) || '';
             const intendedTool = detectToolIntentInNarrative(narrativeSource, tools, { lastUserText: lastUser });
             if (intendedTool) {
+              nluRetryAttempted = true;
               try {
                 // Build correction history. The cascade backend treats
                 // the assistant turn as a "previous response" the model
@@ -2990,6 +3210,70 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
             }
           }
         }
+        // Fail safely: NLU retry was attempted but failed. Return adapter_error
+        // so Hermes can fall back rather than silently returning narration as text.
+        if (nluRetryAttempted && toolCalls.length === 0) {
+          log.warn(`Chat[non-stream]: NLU retry attempted but failed — returning adapter_error (model=${modelKey})`);
+          return buildAdapterErrorResponse({
+            code: 'tool_call_required_but_not_emitted',
+            model: modelKey,
+            message: 'Model narrated tool intent but retry-with-correction also failed to produce structured tool_calls.',
+            diagnostic: {
+              provider,
+              requested_tools: tools.map(t => t?.function?.name || t?.name).filter(Boolean),
+              sample: String(narrativeSource || '').slice(0, 240),
+            },
+            retryPrompt: 'Emit a valid structured tool_call using one of the request-declared tools. Do not narrate.',
+          }, 422);
+        }
+        // Blind retry: model produced empty output with tools declared.
+        // Use the user's last message as context so the model knows what to do.
+        if (toolCalls.length === 0
+            && nluRetryEnabled
+            && Array.isArray(tools) && tools.length > 0
+            && !narrativeSource) {
+          const lastUser = latestRealUserText(messages) || '';
+          if (lastUser) {
+            log.info(`Chat[non-stream]: blind retry — model produced empty output, retrying with user prompt (model=${modelKey})`);
+            try {
+              const correctionMessages = [
+                ...cascadeMessages,
+                { role: 'user', content:
+                  `You didn't produce any output. The user asked: "${lastUser.slice(0, 2000)}"\n\n` +
+                  `Use the appropriate tool from the definitions above to handle this request. ` +
+                  `Emit the tool call using the EXACT protocol format. Do NOT narrate. Just the protocol block.\n\n` +
+                  `你没有输出任何内容。用户的问题："${lastUser.slice(0, 500)}"。请使用上面定义的工具，按协议格式 emit tool call，不要 narrate。` },
+              ];
+              const retryChunks = await client.cascadeChat(correctionMessages, modelEnum, modelUid, {
+                reuseEntry: null,
+                toolPreamble: nativeBridgeOn ? '' : toolPreamble,
+                nativeEnvironment: nativeBridgeOn ? (nativeOpts?.environment || '') : '',
+                displayModel: model,
+                nativeMode: nativeBridgeOn,
+                nativeAllowlist: nativeOpts?.allowlist || null,
+                additionalSteps: nativeOpts?.additionalSteps || null,
+              });
+              let retryText = '';
+              for (const c of retryChunks) {
+                if (c.text) retryText += c.text;
+              }
+              const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route });
+              const retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], tools);
+              if (retryCalls.length) {
+                log.info(`Chat[non-stream]: blind retry — promoted ${retryCalls.length} tool_call(s) (model=${modelKey})`);
+                toolCalls = retryCalls;
+                bridgeDiag.emulatedToolCalls += retryCalls.length;
+                bridgeDiag.emulatedNames.push(...retryCalls.map(tc => tc.name));
+                allText = retryParsed.text || '';
+                allThinking = '';
+              } else {
+                log.warn(`Chat[non-stream]: blind retry — still 0 tool_calls after retry (model=${modelKey})`);
+              }
+            } catch (retryErr) {
+              log.warn(`Chat[non-stream]: blind retry failed: ${retryErr.message}`);
+            }
+          }
+        }
       } else {
         allText = stripToolMarkupFromText(allText);
       }
@@ -3004,6 +3288,24 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       const chunks = await client.rawGetChatMessage(messages, modelEnum, modelUid);
       for (const c of chunks) {
         if (c.text) allText += c.text;
+      }
+    }
+
+    if (emulateTools && Array.isArray(tools) && tools.length > 0 && toolCalls.length === 0) {
+      const narrativeSourceForStrictAdapter = (allText && allText.trim()) ? allText : allThinking;
+      if (looksLikeNarratedToolIntent(narrativeSourceForStrictAdapter)) {
+        log.warn(`Chat[non-stream]: strict adapter_error — model narrated tool intent but emitted no structured tool_call (model=${modelKey})`);
+        return buildAdapterErrorResponse({
+          code: 'tool_call_required_but_not_emitted',
+          model: modelKey,
+          message: 'Model narrated tool intent but emitted no structured tool_call. Refusing to fabricate a tool call from prose.',
+          diagnostic: {
+            provider,
+            requested_tools: tools.map(t => t?.function?.name || t?.name).filter(Boolean),
+            sample: String(narrativeSourceForStrictAdapter || '').slice(0, 240),
+          },
+          retryPrompt: 'Emit a valid structured tool_call using one of the request-declared tools. Do not narrate the action.',
+        }, 422);
       }
     }
 
@@ -3478,6 +3780,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
 
       const emitToolCallDelta = (tc, idx) => {
         emittedClientPayload = true;
+        log.info(`ToolCallDelta[${reqId}]: index=${idx} name=${tc?.name || ''} source=stream`);
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: {
             tool_calls: [{
@@ -3840,7 +4143,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 // v2.0.76 (#120 follow-up): widened to fire even when
                 // markers were detected but parser produced 0 calls
                 // (mirrors the non-stream path).
-                if (declaredTools.length > 0) {
+                if (false && declaredTools.length > 0) {
                   const lastUser = latestRealUserText(messages) || '';
                   const recovered = extractIntentFromNarrative(accNarrative, declaredTools, { lastUserText: lastUser, markers });
                   if (recovered.length) {

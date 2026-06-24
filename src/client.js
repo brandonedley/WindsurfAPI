@@ -1445,21 +1445,31 @@ export class GetChatMessageCloudError extends Error {
 }
 
 // Per-account devin-session-token cache (raw token used after "Basic ").
+// Entries are { token, mintedAt }. Devin session tokens are time-bounded, so
+// a stale token must expire (TTL) and be evicted on an auth rejection —
+// otherwise a long-running process would pin a dead token until restart.
 const _devinTokenCache = new Map();
+const DEVIN_TOKEN_TTL_MS = 50 * 60 * 1000; // 50 min; conservative vs typical JWT lifetimes
 
 async function mintDevinToken(account, tokenFetcher, fetchImpl) {
   const apiKey = account?.apiKey || account?.api_key;
   if (!apiKey) throw new GetChatMessageCloudError('account.apiKey is required to mint a Devin session token');
   const cached = _devinTokenCache.get(apiKey);
-  if (cached) return cached;
+  if (cached && (Date.now() - cached.mintedAt) < DEVIN_TOKEN_TTL_MS) return cached.token;
   const fetcher = tokenFetcher || ((key) => fetchSelfDevinSessionToken(key, {
     apiServerUrl: account?.apiServerUrl,
     fetchImpl,
   }));
   const token = await fetcher(apiKey);
   if (!token) throw new GetChatMessageCloudError('Devin session token fetch returned empty');
-  _devinTokenCache.set(apiKey, token);
+  _devinTokenCache.set(apiKey, { token, mintedAt: Date.now() });
   return token;
+}
+
+/** Drop a single account's cached token (e.g. after a 401/403). */
+function _evictDevinToken(account) {
+  const apiKey = account?.apiKey || account?.api_key;
+  if (apiKey) _devinTokenCache.delete(apiKey);
 }
 
 /** Test/maintenance hook: clear the per-account token cache. */
@@ -1538,6 +1548,9 @@ export async function getChatMessageWithTools(opts = {}) {
 
   const payload = Buffer.from(await response.arrayBuffer());
   if (!response.ok) {
+    // A 401/403 means the cached session token is stale/revoked — evict it so
+    // the next call re-mints instead of replaying a dead token.
+    if (response.status === 401 || response.status === 403) _evictDevinToken(account);
     throw new GetChatMessageCloudError(`GetChatMessage failed with HTTP ${response.status}`, {
       status: response.status,
       bodyPreview: payload.toString('utf8', 0, Math.min(payload.length, 240)),

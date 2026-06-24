@@ -34,11 +34,18 @@ import {
 
 // ─── Enums (CONFIRMED) ─────────────────────────────────────
 
+// ChatMessageSource — values CONFIRMED from captured affogato continuation
+// traffic (flow 008): the prior assistant tool-call turn is encoded source=2,
+// the tool result source=4, and system context (rules/skills) is folded into
+// USER=1 turns. The legacy src/windsurf.js labels (SYSTEM=2, ASSISTANT=3) are
+// for a different/older message type and do NOT apply here — using ASSISTANT=3
+// makes the GLM provider reject multi-turn requests as malformed.
 export const SOURCE = {
   USER: 1,
-  SYSTEM: 2,
-  ASSISTANT: 3,
+  ASSISTANT: 2,
   TOOL: 4,
+  // No distinct SYSTEM source in this protocol; fold system into USER.
+  SYSTEM: 1,
 };
 
 export const REQUEST_TYPE_CASCADE = 5;
@@ -184,10 +191,10 @@ export function buildChatMessagePrompt(msg, messageId) {
   const text = contentToText(msg.content);
   const parts = [writeStringField(1, messageId), writeVarintField(2, source)];
 
-  // Always emit the prompt text field #3 (empty string allowed for an
-  // assistant turn that only carried tool_calls). writeStringField drops ''
-  // fields, so encode #3 explicitly to keep it present.
-  parts.push(writeStringFieldAllowEmpty(3, text));
+  // Emit #3 prompt only when there's actual text. Captured affogato traffic
+  // (flow 008 prompt#5) omits #3 entirely on an assistant turn that carried
+  // only tool_calls — an empty #3 there is not what the real client sends.
+  if (text) parts.push(writeStringField(3, text));
 
   if (source === SOURCE.ASSISTANT && Array.isArray(msg.tool_calls)) {
     for (const tc of msg.tool_calls) {
@@ -206,8 +213,17 @@ export function buildChatMessagePrompt(msg, messageId) {
 // encode a length-delimited field unconditionally.
 function writeStringFieldAllowEmpty(field, str) {
   const data = Buffer.from(str ?? '', 'utf-8');
-  const tag = (field << 3) | 2;
-  const prefix = [tag];
+  const prefix = [];
+  // Varint-encode the tag (field << 3 | wireType). A raw byte only works for
+  // field < 16; for field >= 16 the tag exceeds 0x7f and needs continuation bytes.
+  let tag = (field << 3) | 2;
+  do {
+    let b = tag & 0x7f;
+    tag = Math.floor(tag / 128);
+    if (tag > 0) b |= 0x80;
+    prefix.push(b);
+  } while (tag > 0);
+  // Varint-encode the length.
   let v = data.length;
   do {
     let b = v & 0x7f;

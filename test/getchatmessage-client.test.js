@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-import { getChatMessageWithTools, GetChatMessageCloudError } from '../src/client.js';
+import { getChatMessageWithTools, GetChatMessageCloudError, _clearDevinTokenCache } from '../src/client.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIX = join(__dirname, 'fixtures', 'getchatmessage');
@@ -131,3 +131,44 @@ function makeErrorTrailerBody(json) {
   header.writeUInt32BE(payload.length, 1);
   return Buffer.concat([header, payload]);
 }
+
+// ─── Regression: devin session-token cache TTL + eviction (fix #4) ───
+
+test('caches the session token across calls, re-mints after a 401 eviction', async () => {
+  _clearDevinTokenCache();
+  let mints = 0;
+  const tokenFetcher = async () => { mints += 1; return `devin-token-${mints}`; };
+  const acct = { apiKey: 'devin-acct-A', apiServerUrl: 'https://server.codeium.com' };
+  const call = (status) => getChatMessageWithTools({
+    account: acct,
+    messages: [{ role: 'user', content: 'x' }],
+    tools, model: 'glm-5-2',
+    fetchImpl: makeFetch({ status }),
+    tokenFetcher,
+  });
+
+  await call(200);
+  await call(200);
+  assert.equal(mints, 1, 'token reused within TTL — minted once');
+
+  // A 401 must evict the cached token...
+  await assert.rejects(() => call(401), (e) => e instanceof GetChatMessageCloudError && e.status === 401);
+  // ...so the next call re-mints.
+  await call(200);
+  assert.equal(mints, 2, 'stale token evicted on 401, re-minted on next call');
+});
+
+test('does NOT evict the token on a 429 (rate-limit is account-level, token still valid)', async () => {
+  _clearDevinTokenCache();
+  let mints = 0;
+  const tokenFetcher = async () => { mints += 1; return `devin-token-${mints}`; };
+  const acct = { apiKey: 'devin-acct-B', apiServerUrl: 'https://server.codeium.com' };
+  const call = (status) => getChatMessageWithTools({
+    account: acct, messages: [{ role: 'user', content: 'x' }], tools, model: 'glm-5-2',
+    fetchImpl: makeFetch({ status }), tokenFetcher,
+  });
+  await call(200);
+  await assert.rejects(() => call(429));
+  await call(200);
+  assert.equal(mints, 1, '429 should not evict the session token');
+});

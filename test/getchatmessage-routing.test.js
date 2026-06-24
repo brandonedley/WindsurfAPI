@@ -217,3 +217,135 @@ test('flag-off decision is independent of model/tools so legacy path is unchange
     }
   }
 });
+
+// ─── Regression: adversarial-review fixes (flag-ON safety) ───
+
+test('does NOT route deprecated / special-agent models even with flag+tools (fix #6)', () => {
+  const env = { WINDSURFAPI_GETCHATMESSAGE_TOOLS: '1' };
+  // adaptive/arena-* carry a modelUid (supportsToolCalls=true) but are
+  // deprecated special_agent models with their own routing — must be excluded.
+  for (const modelKey of ['adaptive', 'arena-fast', 'arena-smart']) {
+    assert.equal(supportsToolCalls(modelKey), true, `${modelKey} has a uid`);
+    assert.equal(shouldRouteGetChatMessageTools({ env, modelKey, tools }), false, `${modelKey} must not route`);
+  }
+});
+
+test('mapGetChatMessageResultToChoice drops tool calls not in declared tools[] (fix #2 allowlist)', () => {
+  const parsed = {
+    stopReason: 10,
+    toolCalls: [
+      { id: 't1', name: 'exec', argumentsJson: '{"command":"echo hi"}' },
+      { id: 't2', name: 'Bash', argumentsJson: '{"command":"rm -rf /"}' }, // never declared
+    ],
+  };
+  const choice = mapGetChatMessageResultToChoice(parsed, tools); // tools declares only 'exec'
+  const names = (choice.message.tool_calls || []).map(c => c.function.name);
+  assert.deepEqual(names, ['exec']);
+});
+
+test('mapGetChatMessageResultToChoice sanitizes workspace paths in arguments (fix #2 sanitize)', () => {
+  const parsed = {
+    stopReason: 10,
+    toolCalls: [{ id: 't1', name: 'exec', argumentsJson: '{"path":"/home/user/projects/workspace-abc123/secret.txt"}' }],
+  };
+  const choice = mapGetChatMessageResultToChoice(parsed, tools);
+  const args = choice.message.tool_calls[0].function.arguments;
+  assert.ok(!/workspace-abc123/.test(args), `workspace path should be redacted, got: ${args}`);
+});
+
+test('mapGetChatMessageResultToChoice with no allowlist still returns calls (back-compat)', () => {
+  const parsed = { stopReason: 10, toolCalls: [{ id: 't1', name: 'whatever', argumentsJson: '{}' }] };
+  const choice = mapGetChatMessageResultToChoice(parsed); // no tools arg
+  assert.equal(choice.message.tool_calls.length, 1);
+});
+
+test('native route returns clean exhaustion (no legacy fall-through) when no account available (#2)', async () => {
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    let transportCalls = 0;
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => null,            // no immediate account
+      waitForAccount: async () => null, // none frees up
+      __nativeToolsTransport: async () => { transportCalls += 1; return { text: '', stopReason: 10, toolCalls: [], openaiToolCalls: [] }; },
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'echo x' }], tools },
+      ctx,
+    );
+    assert.equal(transportCalls, 0, 'no account => native transport not invoked');
+    assert.ok(res.status === 429 || res.status === 503, `clean rate-limit/exhaustion expected, got ${res.status}`);
+    assert.ok(['rate_limit_exceeded', 'pool_exhausted'].includes(res.body.error.type), `clean error type, got ${res.body.error.type}`);
+    // A 503 from the native block names the transport — proves we did NOT fall
+    // through to the legacy emulation machinery.
+    if (res.status === 503) assert.match(res.body.error.message, /native tool transport/);
+  } finally {
+    if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});
+
+test('transient upstream trailer => retryable 502 (not treated as rate limit); real 429 => 429', async () => {
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    const baseCtx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+    };
+    // (a) transient model-side error trailer — must surface as a retryable
+    // upstream_error, NOT rate_limit_exceeded (so it won't read as cooldown).
+    const transient = Object.assign(new Error('GetChatMessage error trailer: provider experiencing issues'), { errorTrailer: { error: { code: 'unknown' } } });
+    const resT = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'x' }], tools },
+      { ...baseCtx, __nativeToolsTransport: async () => { throw transient; } },
+    );
+    assert.equal(resT.status, 502, `transient trailer => 502, got ${resT.status}`);
+    assert.equal(resT.body.error.type, 'upstream_error');
+
+    // (b) a real HTTP 429 => 429 rate_limit_exceeded.
+    const rl = Object.assign(new Error('HTTP 429'), { status: 429 });
+    const res429 = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'x' }], tools },
+      { ...baseCtx, __nativeToolsTransport: async () => { throw rl; } },
+    );
+    assert.equal(res429.status, 429);
+    assert.equal(res429.body.error.type, 'rate_limit_exceeded');
+  } finally {
+    if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});
+
+test('native route honors stream:true => SSE chunks with tool_calls + [DONE]', async () => {
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+      __nativeToolsTransport: async () => ({
+        text: '', stopReason: 10,
+        toolCalls: [{ id: 't1', name: 'exec', argumentsJson: '{"command":"echo hi"}' }],
+        openaiToolCalls: [{ id: 't1', type: 'function', function: { name: 'exec', arguments: '{"command":"echo hi"}' } }],
+      }),
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', stream: true, messages: [{ role: 'user', content: 'x' }], tools },
+      ctx,
+    );
+    assert.equal(res.stream, true, 'must return a streaming response for stream:true');
+    assert.equal(res.headers['Content-Type'], 'text/event-stream');
+    let out = '';
+    const fakeRes = { writableEnded: false, write(s) { out += s; }, end() { this.writableEnded = true; } };
+    await res.handler(fakeRes);
+    assert.match(out, /chat\.completion\.chunk/, 'emits chunk objects');
+    assert.match(out, /exec/, 'streams the tool call');
+    assert.match(out, /"finish_reason":"tool_calls"/, 'final chunk has tool_calls finish_reason');
+    assert.match(out, /data: \[DONE\]/, 'terminates with [DONE]');
+  } finally {
+    if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});

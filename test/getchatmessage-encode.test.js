@@ -212,7 +212,7 @@ test('assistant tool_calls and tool results round-trip into ChatMessagePrompt', 
   const prompts = getAllFields(top, 3);
   assert.equal(prompts.length, 3);
 
-  // assistant prompt: source=3, tool_calls at #6
+  // assistant prompt: source=2 (ASSISTANT), tool_calls at #6
   const asst = parseFields(prompts[1].value);
   assert.equal(getField(asst, 2, 0).value, SOURCE.ASSISTANT);
   const tc = parseFields(getField(asst, 6, 2).value);
@@ -247,4 +247,28 @@ test('the captured request fixture decodes to the same top-level shape this enco
   assert.equal(counts[14], undefined, 'fixture omits #14 chat_model_name');
   assert.equal(counts[25], undefined);
   assert.equal(counts[26], undefined);
+});
+
+// ─── Regression: ChatMessageSource LITERAL values (must match affogato) ───
+// Pins the enum to empirically-confirmed wire values so it can't silently
+// regress to the legacy windsurf.js labels (SYSTEM=2/ASSISTANT=3), which make
+// the GLM provider reject multi-turn requests. Verified vs captured flow 008.
+test('multi-turn source values match real affogato capture (assistant=2, tool=4, no #3 on tool-call turn)', () => {
+  const msgs = [
+    { role: 'user', content: 'echo HELLO' },
+    { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'run_shell', arguments: '{"command":"echo HELLO"}' } }] },
+    { role: 'tool', tool_call_id: 'call_1', content: 'HELLO' },
+  ];
+  const body = buildGetChatMessageRequest({ apiKey: 'devin-x', messages: msgs, tools: [{ type: 'function', function: { name: 'run_shell', parameters: { type: 'object', properties: {} } } }], model: 'glm-5-2' });
+  const top = parseFields(stripConnect(Buffer.from(body)));
+  const prompts = top.filter(f => f.field === 3 && f.wireType === 2).map(f => parseFields(f.value));
+  const srcOf = p => p.find(x => x.field === 2)?.value;
+  const has = (p, n) => p.some(x => x.field === n);
+
+  assert.equal(srcOf(prompts[0]), 1, 'user => source 1');
+  assert.equal(srcOf(prompts[1]), 2, 'assistant => source 2 (NOT legacy 3)');
+  assert.equal(has(prompts[1], 6), true, 'assistant carries tool_calls #6');
+  assert.equal(has(prompts[1], 3), false, 'assistant tool-call turn omits #3 (matches affogato)');
+  assert.equal(srcOf(prompts[2]), 4, 'tool => source 4');
+  assert.equal(has(prompts[2], 7), true, 'tool carries tool_call_id #7');
 });
