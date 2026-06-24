@@ -4,10 +4,10 @@
  */
 
 import { createHash, randomUUID } from 'crypto';
-import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
+import { WindsurfClient, contentToString, isCascadeTransportError, getChatMessageWithTools } from '../client.js';
 import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary } from '../auth.js';
 import { isStickyEnabled, setStickyBinding } from '../account/sticky-session.js';
-import { resolveModel, getModelInfo, pickRateLimitFallback } from '../models.js';
+import { resolveModel, getModelInfo, pickRateLimitFallback, supportsToolCalls } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
 import { safeAccountRef, safeKeyRef } from '../log-safety.js';
@@ -54,6 +54,66 @@ const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 const IP_RATE_LIMIT_BURST_FLOOR_MS = 30_000;
+
+// ─── S-tier native tool-calling (GetChatMessage) routing ───
+//
+// Behind WINDSURFAPI_GETCHATMESSAGE_TOOLS=1, requests that declare tools[]
+// against a tool-capable (cascade-uid) model route through the cloud
+// ApiServerService/GetChatMessage transport (src/getchatmessage.js +
+// client.getChatMessageWithTools) which returns NATIVE tool_calls — instead
+// of the prompt-emulation path. When the flag is OFF this helper always
+// returns false, so behavior is byte-identical to today.
+
+/**
+ * Decide whether to route a chat request through the native GetChatMessage
+ * tool transport. Pure — no side effects.
+ *
+ * @param {object} args
+ * @param {object} args.env       process.env (or a subset) carrying the flag
+ * @param {string} args.modelKey  resolved model key/alias
+ * @param {Array}  [args.tools]   OpenAI tools[]
+ * @returns {boolean}
+ */
+export function shouldRouteGetChatMessageTools({ env = process.env, modelKey = '', tools } = {}) {
+  if (!env || env.WINDSURFAPI_GETCHATMESSAGE_TOOLS !== '1') return false;
+  if (!Array.isArray(tools) || tools.length === 0) return false;
+  return supportsToolCalls(modelKey);
+}
+
+/**
+ * Map a parsed GetChatMessage result (from getChatMessageWithTools) to an
+ * OpenAI chat-completion `choice`.
+ *   stop_reason 10 (tool use) -> finish_reason 'tool_calls'
+ *   otherwise                 -> 'stop' (text content)
+ *
+ * @param {object} parsed { text, stopReason, toolCalls, openaiToolCalls }
+ * @returns {object} OpenAI choice
+ */
+export function mapGetChatMessageResultToChoice(parsed) {
+  const openaiToolCalls = Array.isArray(parsed.openaiToolCalls) && parsed.openaiToolCalls.length
+    ? parsed.openaiToolCalls
+    : (parsed.toolCalls || []).map((tc, i) => ({
+        id: tc.id || `call_${i}`,
+        type: 'function',
+        function: { name: tc.name, arguments: tc.argumentsJson || '{}' },
+      }));
+
+  const hasToolCalls = openaiToolCalls.length > 0;
+  const isToolUse = parsed.stopReason === 10 || hasToolCalls;
+
+  if (isToolUse && hasToolCalls) {
+    return {
+      index: 0,
+      message: { role: 'assistant', content: null, tool_calls: openaiToolCalls },
+      finish_reason: 'tool_calls',
+    };
+  }
+  return {
+    index: 0,
+    message: { role: 'assistant', content: parsed.text || '' },
+    finish_reason: 'stop',
+  };
+}
 
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
 // preamble are baked into the digest so a tool schema change misses instead
@@ -1640,6 +1700,67 @@ async function _handleChatCompletionsInner(body, context = {}) {
   const ensureLsFn = context.ensureLs || ensureLs;
   const getLsForFn = context.getLsFor || getLsFor;
   const WindsurfClientClass = context.WindsurfClient || WindsurfClient;
+
+  // ─── S-tier native tool-calling (flag-gated, default OFF) ───
+  //
+  // When WINDSURFAPI_GETCHATMESSAGE_TOOLS=1, a tools[] request against a
+  // tool-capable cascade-uid model is served by the cloud GetChatMessage
+  // transport which returns NATIVE tool_calls (no prompt emulation). The flag
+  // defaults OFF so the legacy path below is byte-identical to today. A
+  // context.__nativeToolsTransport hook lets tests inject a mock transport.
+  {
+    const nativeRouteModelKey = resolveModel(reqModel);
+    if (shouldRouteGetChatMessageTools({ env: process.env, modelKey: nativeRouteModelKey, tools: effectiveTools })) {
+      const transport = context.__nativeToolsTransport || getChatMessageWithTools;
+      const acquireFn = context.getApiKey || getApiKey;
+      const modelInfo = getModelInfo(nativeRouteModelKey);
+      const modelUid = modelInfo?.modelUid || nativeRouteModelKey;
+      const triedNative = [];
+      let nativeAcct = acquireFn(triedNative, nativeRouteModelKey, callerKey);
+      if (!nativeAcct) {
+        nativeAcct = await waitForAccountFn(triedNative, context.signal, undefined, nativeRouteModelKey, callerKey);
+      }
+      if (nativeAcct) {
+        try {
+          const parsed = await transport({
+            account: { apiKey: nativeAcct.apiKey, apiServerUrl: nativeAcct.apiServerUrl },
+            messages,
+            tools: effectiveTools,
+            model: { uid: modelUid },
+            completionConfig: max_tokens ? { maxTokens: max_tokens } : undefined,
+            signal: context.signal,
+          });
+          const choice = mapGetChatMessageResultToChoice(parsed);
+          try { reportSuccess(nativeAcct.apiKey); } catch {}
+          log.info(`Chat[${reqId}]: native GetChatMessage tool route model=${nativeRouteModelKey} stop=${parsed.stopReason} toolCalls=${parsed.toolCalls?.length || 0}`);
+          return {
+            status: 200,
+            body: {
+              id: `chatcmpl-${reqId}${Math.random().toString(36).slice(2, 8)}`,
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: reqModel,
+              choices: [choice],
+              usage: buildUsageBody(null, messages, choice.message.content || ''),
+            },
+          };
+        } catch (err) {
+          // Surface a clean upstream error; do NOT fall through to the legacy
+          // emulation path (the flag opts the caller into native-only).
+          log.warn(`Chat[${reqId}]: native GetChatMessage tool route failed: ${err.message}`);
+          const status = err?.status === 429 ? 429 : (err?.status && err.status >= 400 && err.status < 500 ? err.status : 502);
+          return {
+            status,
+            body: { error: { message: err.message, type: status === 429 ? 'rate_limit_exceeded' : 'upstream_error' } },
+          };
+        } finally {
+          try { releaseAccount(nativeAcct.apiKey); } catch {}
+        }
+      }
+      // No account available — fall through to the legacy machinery below,
+      // which has its own exhaustion/queueing handling.
+    }
+  }
 
   // Probe diagnostics: dump compact request shape for every call, plus a
   // tail of the last user turn. Keeps us able to see how third-party

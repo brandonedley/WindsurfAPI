@@ -470,6 +470,32 @@ export function getModelInfo(id) {
   return MODELS[id] || null;
 }
 
+/**
+ * Whether a model supports native tool-calling via the cloud GetChatMessage
+ * (Cascade) transport. Cascade-uid models — those with a string `modelUid`
+ * (e.g. 'glm-5-2', 'claude-sonnet-4-6') — flow through the
+ * ApiServerService/GetChatMessage endpoint that accepts a tools[] schema.
+ * Legacy enum-only models (RawGetChatMessage) cannot carry tools.
+ *
+ * Accepts a model key OR alias; resolves through the lookup first. The
+ * heuristic mirrors what GetCliModelConfigs reports as
+ * `supports_tool_calls` for these uids; when the registry later surfaces an
+ * explicit per-model flag we prefer it.
+ *
+ * @param {string} id model key or alias
+ * @returns {boolean}
+ */
+export function supportsToolCalls(id) {
+  if (!id) return false;
+  const key = resolveModel(id);
+  const info = MODELS[key] || MODELS[id] || null;
+  if (!info) return false;
+  if (typeof info.supports_tool_calls === 'boolean') return info.supports_tool_calls;
+  // Cascade-uid models route through GetChatMessage and accept tools[].
+  const uid = info.modelUid;
+  return typeof uid === 'string' && uid.length > 0;
+}
+
 // v2.0.84 (#118 0a00) — when an entire account pool is rate-limited
 // on a high-effort variant (`-max` / `-xhigh` / `-thinking-1m`), find
 // a same-base lower-effort variant the user could fall back to. Used

@@ -13,6 +13,12 @@ import { execSync } from 'child_process';
 import { log } from './config.js';
 import { extractImages } from './image.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
+import {
+  buildGetChatMessageRequest,
+  parseGetChatMessageResponse,
+  toOpenAIToolCalls,
+} from './getchatmessage.js';
+import { fetchSelfDevinSessionToken, DEFAULT_CODEIUM_API_SERVER_URL } from './devin-session-token.js';
 import { beginLsUse, endLsUse, getLsEntryByPort } from './langserver.js';
 import {
   buildRawGetChatMessageRequest, parseRawResponse,
@@ -1418,4 +1424,135 @@ export class WindsurfClient {
       endLsUse(this.port);
     }
   }
+}
+
+// ─── Cloud GetChatMessage (native tool-calling) ────────────
+//
+// S-tier transport: calls the Codeium cloud ApiServerService/GetChatMessage
+// directly (NOT the local language server's deprecated copy) with Basic
+// <devin-session-token> auth. Returns native tool_calls. See
+// src/getchatmessage.js for the wire format (proven from captured fixtures).
+
+export class GetChatMessageCloudError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = 'GetChatMessageCloudError';
+    if (options.status) this.status = options.status;
+    if (options.cause) this.cause = options.cause;
+    if (options.bodyPreview) this.bodyPreview = options.bodyPreview;
+    if (options.errorTrailer) this.errorTrailer = options.errorTrailer;
+  }
+}
+
+// Per-account devin-session-token cache (raw token used after "Basic ").
+const _devinTokenCache = new Map();
+
+async function mintDevinToken(account, tokenFetcher, fetchImpl) {
+  const apiKey = account?.apiKey || account?.api_key;
+  if (!apiKey) throw new GetChatMessageCloudError('account.apiKey is required to mint a Devin session token');
+  const cached = _devinTokenCache.get(apiKey);
+  if (cached) return cached;
+  const fetcher = tokenFetcher || ((key) => fetchSelfDevinSessionToken(key, {
+    apiServerUrl: account?.apiServerUrl,
+    fetchImpl,
+  }));
+  const token = await fetcher(apiKey);
+  if (!token) throw new GetChatMessageCloudError('Devin session token fetch returned empty');
+  _devinTokenCache.set(apiKey, token);
+  return token;
+}
+
+/** Test/maintenance hook: clear the per-account token cache. */
+export function _clearDevinTokenCache() { _devinTokenCache.clear(); }
+
+/**
+ * getChatMessageWithTools — POST a native tool-calling request to the cloud
+ * GetChatMessage endpoint and return the parsed result.
+ *
+ * @param {object} opts
+ * @param {object} opts.account   { apiKey, apiServerUrl }
+ * @param {Array}  opts.messages  OpenAI-format messages
+ * @param {Array}  [opts.tools]   OpenAI tools[]
+ * @param {string|object} [opts.model] model uid (string) or { uid }
+ * @param {object} [opts.completionConfig]
+ * @param {object} [opts.ids]     deterministic id injection (tests)
+ * @param {AbortSignal} [opts.signal]
+ * @param {function}    [opts.fetchImpl]    injectable fetch (tests)
+ * @param {function}    [opts.tokenFetcher] injectable token minter (tests)
+ * @returns {Promise<{text, toolCalls, openaiToolCalls, stopReason, usage, errorTrailer}>}
+ */
+export async function getChatMessageWithTools(opts = {}) {
+  const {
+    account,
+    messages = [],
+    tools = [],
+    model,
+    completionConfig,
+    ids,
+    signal,
+    templates,
+    fetchImpl = globalThis.fetch,
+    tokenFetcher,
+  } = opts;
+
+  if (typeof fetchImpl !== 'function') {
+    throw new GetChatMessageCloudError('fetch is not available in this runtime');
+  }
+
+  const token = await mintDevinToken(account, tokenFetcher, fetchImpl);
+
+  const baseUrl = (account?.apiServerUrl || process.env.WINDSURF_API_SERVER_URL || DEFAULT_CODEIUM_API_SERVER_URL)
+    .replace(/\/+$/, '');
+  const url = `${baseUrl}/exa.api_server_pb.ApiServerService/GetChatMessage`;
+
+  // The Metadata #3 auth slot mirrors what the captured request carried: the
+  // literal `devin-session-token$<token>` form. The minted token already
+  // begins with `devin-`; preserve whatever the fetcher returned.
+  const body = buildGetChatMessageRequest({
+    apiKey: token,
+    messages,
+    tools,
+    model,
+    completionConfig,
+    ids,
+    templates,
+  });
+
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        'authorization': `Basic ${token}`,
+        'content-type': 'application/connect+proto',
+        'connect-protocol-version': '1',
+        'accept': '*/*',
+      },
+      body,
+      signal,
+    });
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    throw new GetChatMessageCloudError('GetChatMessage cloud request failed', { cause: err });
+  }
+
+  const payload = Buffer.from(await response.arrayBuffer());
+  if (!response.ok) {
+    throw new GetChatMessageCloudError(`GetChatMessage failed with HTTP ${response.status}`, {
+      status: response.status,
+      bodyPreview: payload.toString('utf8', 0, Math.min(payload.length, 240)),
+    });
+  }
+
+  const parsed = parseGetChatMessageResponse(payload);
+  if (parsed.errorTrailer) {
+    const e = parsed.errorTrailer.error || {};
+    throw new GetChatMessageCloudError(
+      `GetChatMessage error trailer: ${e.code || ''} ${e.message || JSON.stringify(parsed.errorTrailer)}`.trim(),
+      { errorTrailer: parsed.errorTrailer },
+    );
+  }
+
+  parsed.openaiToolCalls = toOpenAIToolCalls(parsed);
+  return parsed;
 }
