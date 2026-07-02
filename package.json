@@ -7,7 +7,17 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
+    "dev:bun": "bun --watch src/index.js",
     "test": "node --import ./test/setup-env.mjs --test --test-force-exit test/*.test.js",
+    "test:bun": "DATA_DIR=.test-data bun test test/*.test.js",
+    "test:compat": "DATA_DIR=.test-data bun test test/hermes-devin-*.test.js test/hermes-devin-*.test.ts test/v2081-chinese-nlu.test.js",
+    "typecheck": "bunx tsc --noEmit",
+    "sync:hermes-devin-ts": "node scripts/sync-hermes-devin-ts.mjs",
+    "verify:hermes-devin": "node scripts/hermes-devin-verify-matrix.mjs --check-log /home/brandon/.pm2/logs/windsurf-api-out.log --tail-lines 120 --require-tool-result",
+    "matrix:hermes-devin": "node scripts/hermes-devin-verify-matrix.mjs --print-matrix",
+    "smoke:hermes-devin": "node scripts/hermes-devin-live-smoke.mjs",
+    "smoke:hermes-devin:basic": "node scripts/hermes-devin-live-smoke.mjs --case basic",
+    "smoke:hermes-devin:full": "node scripts/hermes-devin-live-smoke.mjs --case full",
     "test:shard": "node scripts/run-test-shard.mjs",
     "test:release": "node --import ./test/setup-env.mjs --test --test-force-exit test/cache.test.js test/dashboard-api.test.js test/dashboard-syntax.test.js test/native-bridge-docs.test.js test/proto-trace.test.js test/secret-scan.test.js test/test-shard-script.test.js test/release-workflow.test.js test/version.test.js",
     "smoke:native-bridge": "node scripts/native-bridge-smoke.mjs",
@@ -42,5 +52,9 @@
     "llm-gateway",
     "reverse-engineering",
     "zero-dependency"
-  ]
+  ],
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "bun-types": "^1.3.14"
+  }
 }

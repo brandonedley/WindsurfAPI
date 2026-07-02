@@ -14,6 +14,11 @@ scripts/*
 !scripts/secret-scan.mjs
 !scripts/run-test-shard.mjs
 !scripts/cascade-survival-probe.mjs
+!scripts/devin-session-token-probe.mjs
+!scripts/devin-cloud-acp-handshake-smoke.mjs
+!scripts/sync-hermes-devin-ts.mjs
+!scripts/hermes-devin-verify-matrix.mjs
+!scripts/hermes-devin-live-smoke.mjs
 src/get-token.js
 src/test-cascade.js
 src/runtime-config.json
@@ -45,6 +50,7 @@ COPILOT.md
 audit/
 tmp/
 tmp-testing/
+.test-data/
 runtime-config.json
 stats.json
 package-lock.json
