@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { sanitizeText, PathSanitizeStream, sanitizeToolCall } from '../src/sanitize.js';
+import { sanitizeText, PathSanitizeStream, sanitizeToolCall, _repoRoot } from '../src/sanitize.js';
 
 const MARKER = '<workspace>';
 
@@ -129,6 +129,26 @@ describe('sanitizeToolCall', () => {
   it('returns null/undefined unchanged', () => {
     assert.equal(sanitizeToolCall(null), null);
     assert.equal(sanitizeToolCall(undefined), undefined);
+  });
+
+  // Regression: when the agent's workspace IS the proxy's own repo root, a
+  // legitimate absolute-path tool call must execute, not get rewritten to
+  // `<workspace>` (which fails and makes the agent loop). Real local paths pass
+  // through executable args; only hallucinated Cascade paths are stripped.
+  it('passes the proxy repo-root absolute path through executable tool args', () => {
+    const cmd = `git -C ${_repoRoot}/sub status --porcelain`;
+    const tc = { name: 'run_shell', argumentsJson: JSON.stringify({ command: cmd }) };
+    const result = sanitizeToolCall(tc);
+    assert.equal(JSON.parse(result.argumentsJson).command, cmd, 'real repo path must survive in tool args');
+  });
+
+  it('still strips hallucinated Cascade paths from executable tool args', () => {
+    const tc = { name: 'Read', input: { path: '/tmp/windsurf-workspace/f.js' } };
+    assert.equal(sanitizeToolCall(tc).input.path, MARKER);
+  });
+
+  it('still redacts the repo-root path in user-visible TEXT (privacy preserved)', () => {
+    assert.equal(sanitizeText(`opened ${_repoRoot}/src/x.js`), `opened ${MARKER}`);
   });
 });
 

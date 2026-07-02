@@ -24,7 +24,7 @@
 // Detect the actual project root from this module's path so the sanitizer
 // covers deployments outside /root/WindsurfAPI (e.g. /srv/WindsurfAPI).
 import { fileURLToPath as _fileURLToPath } from 'url';
-const _repoRoot = (() => {
+export const _repoRoot = (() => {
   try {
     const thisFile = _fileURLToPath(import.meta.url);
     // sanitize.js is in src/, so project root is one directory up.
@@ -63,7 +63,11 @@ const REDACTED_PATH = '<workspace>';
 // Note: `\\` is INSIDE the char class so backslash-separated tails (Windows
 // style: `\home\user\projects\workspace-x\src\index.js`) keep extending the
 // match instead of terminating at the first backslash.
-const PATTERNS = [
+// Hallucinated Windsurf/Cascade paths + upstream-injected XML state blocks.
+// None of these is ever a real on-disk path on the caller's machine, so they
+// are safe to strip EVERYWHERE — including inside executable tool-call
+// arguments (a redacted hallucination was going to fail on execution anyway).
+const HALLUCINATED_PATTERNS = [
   [/\/tmp\/windsurf-workspace(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
   // Unix and Windows-mixed forms — issue #86 reports of
   // `C:\home\user\projects\workspace-devinxse` leaking despite the Unix-only
@@ -73,8 +77,6 @@ const PATTERNS = [
   //   C:\home\user\projects\workspace-x[\...]
   //   C:\home/user/projects/workspace-x  (mixed separators, GLM-style hallucination)
   [/(?:[A-Za-z]:)?[/\\]home[/\\]user[/\\]projects[/\\]workspace-[a-z0-9]+(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
-  [/\/opt\/windsurf(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
-  [new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[/\\\\][^\\s"\'`<>)}\\],*;]*)?', 'g'), REDACTED_PATH],
   // v2.0.78 (#108 zhangzhang-bit) — Cascade upstream injects these XML
   // blocks into the system prompt to describe its sandbox state:
   //   <workspace_information>...workspace path / metadata...</workspace_information>
@@ -90,6 +92,23 @@ const PATTERNS = [
   [/<workspace_layout>[\s\S]*?<\/workspace_layout>/gi, ''],
   [/<user_information>[\s\S]*?<\/user_information>/gi, ''],
 ];
+
+// REAL on-disk paths: the LS install dir and the proxy's own repo root. Fine to
+// hide in user-visible TEXT (privacy), but they must NOT be applied to
+// executable tool-call arguments. When the agent's workspace IS one of these
+// dirs — e.g. obie operating on the WindsurfAPI repo the proxy runs from — the
+// redaction turns a legitimate `git -C /…/WindsurfAPI status` into
+// `git -C <workspace> status`, which fails, and the agent loops on it. See
+// sanitizeToolArgText below.
+const REAL_PATH_PATTERNS = [
+  [/\/opt\/windsurf(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  [new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[/\\\\][^\\s"\'`<>)}\\],*;]*)?', 'g'), REDACTED_PATH],
+];
+
+// Full set for user-visible text (response narration). Hallucinated + XML
+// patterns match disjoint prefixes from the real-path patterns, so composition
+// order does not change the redacted output.
+const PATTERNS = [...HALLUCINATED_PATTERNS, ...REAL_PATH_PATTERNS];
 
 // Tags whose ENTIRE block (open → close) is upstream-injected and must
 // be held back during streaming until we see the closing tag — otherwise
@@ -121,6 +140,22 @@ export function sanitizeText(s) {
   if (typeof s !== 'string' || !s) return s;
   let out = s;
   for (const [re, rep] of PATTERNS) out = out.replace(re, rep);
+  return out;
+}
+
+/**
+ * Sanitize text destined for an EXECUTABLE tool-call argument. Strips only the
+ * hallucinated Windsurf/Cascade paths (never real on-disk paths), so a
+ * legitimate absolute path the agent operates on — including the proxy's own
+ * repo root when that happens to be the agent's workspace — passes through
+ * intact and the command actually runs. Applying the real-path redactions here
+ * would rewrite `git -C /…/WindsurfAPI status` to `git -C <workspace> status`
+ * and the agent would loop on the failure.
+ */
+export function sanitizeToolArgText(s) {
+  if (typeof s !== 'string' || !s) return s;
+  let out = s;
+  for (const [re, rep] of HALLUCINATED_PATTERNS) out = out.replace(re, rep);
   return out;
 }
 
@@ -251,12 +286,15 @@ export class PathSanitizeStream {
 export function sanitizeToolCall(tc) {
   if (!tc) return tc;
   const out = { ...tc };
-  if (typeof tc.argumentsJson === 'string') out.argumentsJson = sanitizeText(tc.argumentsJson);
+  // argumentsJson + input are EXECUTABLE — only strip hallucinated paths so the
+  // agent's real filesystem paths survive (see sanitizeToolArgText). `result`
+  // is tool output that gets displayed, so it keeps the full text redactions.
+  if (typeof tc.argumentsJson === 'string') out.argumentsJson = sanitizeToolArgText(tc.argumentsJson);
   if (typeof tc.result === 'string') out.result = sanitizeText(tc.result);
   if (tc.input && typeof tc.input === 'object' && !Array.isArray(tc.input)) {
     const safe = {};
     for (const [k, v] of Object.entries(tc.input)) {
-      safe[k] = typeof v === 'string' ? sanitizeText(v) : v;
+      safe[k] = typeof v === 'string' ? sanitizeToolArgText(v) : v;
     }
     out.input = safe;
   }
