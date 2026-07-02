@@ -13,6 +13,14 @@ import {
   normalizeMessagesForCascade,
 } from '../src/handlers/tool-emulation.js';
 
+// pickToolDialect reads the WINDSURFAPI_FORCE_* overrides from process.env at
+// call time, and importing tool-emulation.js pulls in config.js which loads the
+// operator's real .env — so a deployment that forces gpt_native would flip
+// every default-behavior assertion below. Clear the overrides here; the
+// override-specific tests set and restore them per-case.
+delete process.env.WINDSURFAPI_FORCE_GPT_NATIVE_DIALECT;
+delete process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+
 describe('pickToolDialect — gpt_native gating (v2.0.62 #115)', () => {
   it('GPT family + responses route → gpt_native', () => {
     assert.equal(pickToolDialect('gpt-5.5-medium', 'openai', 'responses'), 'gpt_native');
@@ -35,6 +43,28 @@ describe('pickToolDialect — gpt_native gating (v2.0.62 #115)', () => {
   it('GLM and Kimi precedence beats GPT detection', () => {
     assert.equal(pickToolDialect('glm-5.1', 'zhipu', 'responses'), 'glm47');
     assert.equal(pickToolDialect('kimi-k2', 'moonshot', 'responses'), 'kimi_k2');
+  });
+
+  it('WINDSURFAPI_FORCE_GLM_DIALECT can opt GLM into gpt_native experimentally', () => {
+    const orig = process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+    process.env.WINDSURFAPI_FORCE_GLM_DIALECT = 'gpt_native';
+    try {
+      assert.equal(pickToolDialect('glm-5.2', 'zhipu', 'chat'), 'gpt_native');
+    } finally {
+      if (orig === undefined) delete process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+      else process.env.WINDSURFAPI_FORCE_GLM_DIALECT = orig;
+    }
+  });
+
+  it('invalid WINDSURFAPI_FORCE_GLM_DIALECT falls back to glm47', () => {
+    const orig = process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+    process.env.WINDSURFAPI_FORCE_GLM_DIALECT = 'not_a_dialect';
+    try {
+      assert.equal(pickToolDialect('glm-5.2', 'zhipu', 'chat'), 'glm47');
+    } finally {
+      if (orig === undefined) delete process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+      else process.env.WINDSURFAPI_FORCE_GLM_DIALECT = orig;
+    }
   });
 
   it('WINDSURFAPI_FORCE_GPT_NATIVE_DIALECT=1 forces gpt_native on chat route too', () => {

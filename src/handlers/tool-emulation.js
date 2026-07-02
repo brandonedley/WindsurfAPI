@@ -224,6 +224,9 @@ export function pickToolDialect(modelKey, provider, route = null) {
   const normalizedProvider = String(provider || '').toLowerCase();
   const normalizedModelKey = String(modelKey || '').toLowerCase();
   if (normalizedProvider === 'zhipu' || normalizedModelKey.startsWith('glm')) {
+    // Explicit operator override wins (WINDSURFAPI_FORCE_GLM_DIALECT).
+    const forcedGlmDialect = String(process.env.WINDSURFAPI_FORCE_GLM_DIALECT || '').trim().toLowerCase();
+    if (['glm47', 'openai_json_xml', 'gpt_native'].includes(forcedGlmDialect)) return forcedGlmDialect;
     // v2.0.72 — glm-5.2 probe: the glm47 XML markup dialect is ignored and
     // the model answers in plain text. The gpt_native function_call JSON
     // dialect is emitted reliably and parsed correctly. Keep older GLM on
