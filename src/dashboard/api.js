@@ -19,6 +19,7 @@ import {
 import { restartLsForProxy } from '../langserver.js';
 import { getLsStatus, stopLanguageServerAndWait, startLanguageServer, isLanguageServerRunning, getLsAdmissionStatus } from '../langserver.js';
 import { getStats, resetStats, recordRequest } from './stats.js';
+import { getQuotaWindowSummary } from '../quota-window.js';
 import { cacheStats, cacheClear } from '../cache.js';
 import {
   getExperimental, setExperimental, getSystemPrompts, setSystemPrompts, resetSystemPrompt,
@@ -854,6 +855,13 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // ─── Drought summary (v2.0.57 Fix 5) ──────────────────
   if (subpath === '/drought' && method === 'GET') {
     return json(res, 200, getDroughtSummary());
+  }
+
+  // ─── Quota windows (per-model message-cap governor) ────
+  // Live per-account+model window usage vs the empirically learned cap,
+  // window reset ETA, and lockout history. See src/quota-window.js.
+  if (subpath === '/quota-windows' && method === 'GET') {
+    return json(res, 200, getQuotaWindowSummary());
   }
 
   // ─── Upstream endpoints (v2.0.60 — show migration status) ──

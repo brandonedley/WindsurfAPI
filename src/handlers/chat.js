@@ -13,6 +13,7 @@ import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
 import { safeAccountRef, safeKeyRef } from '../log-safety.js';
 import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
+import { recordUpstreamSend, onRateLimitLockout, shouldSoftLimitModel } from '../quota-window.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative } from './intent-extractor.js';
 import { markRequest as markQuietWindowRequest } from '../dashboard/quiet-window-updater.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
@@ -1844,6 +1845,17 @@ async function _handleChatCompletionsInner(body, context = {}) {
     // silently drop the thinking instruction.
     const nativeRouteModelKey = resolveEffectiveModelKey(resolveModel(reqModel), isThinkingRequested(body));
     if (shouldRouteGetChatMessageTools({ env: process.env, modelKey: nativeRouteModelKey, tools: effectiveTools })) {
+      // Quota governor (flag-gated): refuse locally when the model's learned
+      // per-window message budget is nearly spent, instead of burning the last
+      // messages and taking the multi-hour upstream lockout. Same 429 shape as
+      // the cooldown returns below — agent clients follow Retry-After into
+      // their fallback provider.
+      const softLimit = shouldSoftLimitModel(nativeRouteModelKey);
+      if (softLimit.limited) {
+        const retryAfterSec = Math.max(1, Math.ceil(softLimit.retryAfterMs / 1000));
+        log.warn(`Chat[${reqId}]: quota governor — ${nativeRouteModelKey} near learned window cap, refusing locally (retry ${retryAfterSec}s)`);
+        return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${reqModel} 已接近本窗口消息配额（quota governor），请 ${retryAfterSec} 秒后重试或换用其他模型`, type: 'rate_limit_exceeded', retry_after_ms: softLimit.retryAfterMs } } };
+      }
       const transport = context.__nativeToolsTransport || getChatMessageWithTools;
       const acquireFn = context.getApiKey || getApiKey;
       const modelInfo = getModelInfo(nativeRouteModelKey);
@@ -1877,6 +1889,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
         // under-reports exactly the traffic that burns rate-limit windows.
         const nativeStart = Date.now();
         try {
+          // Count the attempt (not the outcome): a failed call may still
+          // consume a message from the upstream per-model window.
+          try { recordUpstreamSend(nativeAcct.apiKey, nativeRouteModelKey); } catch {}
           const parsed = await transport({
             account: { apiKey: nativeAcct.apiKey, apiServerUrl: nativeAcct.apiServerUrl },
             messages,
@@ -1937,7 +1952,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
             || rlCooldownMs != null
             || /reached message rate limit|rate[\s-]?limit|too many requests/i.test(err?.message || '');
           try {
-            if (isRateLimit) { markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || rlCooldownMs || 60000, nativeRouteModelKey); recordRateLimited(); }
+            if (isRateLimit) { markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || rlCooldownMs || 60000, nativeRouteModelKey); recordRateLimited(); onRateLimitLockout(nativeAcct.apiKey, nativeRouteModelKey, err?.retryAfterMs || rlCooldownMs || 60000); }
             else if (err?.status === 401 || err?.status === 403) reportError(nativeAcct.apiKey);
             else if (!isUpstreamModelTrailer && (!err?.status || err.status >= 500)) reportInternalError(nativeAcct.apiKey);
             // else: transient upstream model trailer — retryable, no penalty.
@@ -2434,6 +2449,17 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // 503 + retry-after instead of letting the request burn its way to
   // an upstream rate-limit. Free-tier models (gemini-2.5-flash etc.)
   // still go through.
+  // Quota governor (flag-gated): same local-refusal pattern as drought mode,
+  // but for the per-model MESSAGE window instead of the weekly credit quota.
+  {
+    const softLimit = shouldSoftLimitModel(routingModelKey);
+    if (softLimit.limited) {
+      const retryAfterSec = Math.max(1, Math.ceil(softLimit.retryAfterMs / 1000));
+      log.warn(`Chat[${reqId}]: quota governor — ${routingModelKey} near learned window cap, refusing locally (retry ${retryAfterSec}s)`);
+      return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 已接近本窗口消息配额（quota governor），请 ${retryAfterSec} 秒后重试或换用其他模型`, type: 'rate_limit_exceeded', retry_after_ms: softLimit.retryAfterMs } } };
+    }
+  }
+
   if (isModelBlockedByDrought(routingModelKey)) {
     const summary = getDroughtSummary();
     const freeList = (summary.freeTierModels || []).slice(0, 4).join(', ') || 'gemini-2.5-flash';
@@ -2717,6 +2743,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
           refundReservation(acct.apiKey, acct.reservationTimestamp);
           if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
             markRateLimited(acct.apiKey, rl.retryAfterMs, routingModelKey);
+            onRateLimitLockout(acct.apiKey, routingModelKey, rl.retryAfterMs);
           }
           if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
             const availability = getAccountAvailability(acct.apiKey, routingModelKey);
@@ -3423,6 +3450,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     reportSuccess(apiKey);
     updateCapability(apiKey, modelKey, true, 'success');
     recordRequest(model, true, Date.now() - startTime, apiKey);
+    try { recordUpstreamSend(apiKey, modelKey); } catch {}
 
     // Store in cache for next identical request. Skip caching tool_call
     // responses — they're inherently contextual and the cache doesn't
@@ -3514,7 +3542,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // moderation" warnings (which can be retried on a different model).
     const isPolicyBlocked = /cyber\s*verification|content[\s_-]+policy|policy[\s_-]+(?:violation|blocked|denied)|safety[\s_-]+(?:policy|blocked)|prompt[\s_-]+(?:rejected|blocked)\s+by[\s_-]+policy|usage[\s_-]+policy[\s_-]+violation/i.test(err.message);
     if (isAuthFail) reportError(apiKey);
-    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
+    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); onRateLimitLockout(apiKey, modelKey, rateLimitCooldownMs(err.message)); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
     if (isInternal) { reportInternalError(apiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
     if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
     if (isPolicyBlocked) { err.isPolicyBlocked = true; err.isModelError = true; err.kind = 'policy_blocked'; }
@@ -3529,6 +3557,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       updateCapability(apiKey, modelKey, false, 'model_error');
     }
     recordRequest(model, false, Date.now() - startTime, apiKey);
+    try { recordUpstreamSend(apiKey, modelKey); } catch {}
     log.error('Chat error:', err.message);
     // v2.0.61 — policy block surfaces as 451 Unavailable For Legal Reasons,
     // which is exactly the semantic clients need (the model refuses the
@@ -4070,6 +4099,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 refundReservation(acct.apiKey, acct.reservationTimestamp);
                 if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
                   markRateLimited(acct.apiKey, rl.retryAfterMs, modelKey);
+                  onRateLimitLockout(acct.apiKey, modelKey, rl.retryAfterMs);
                 }
                 if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
                   const availability = getAccountAvailability(acct.apiKey, modelKey);
@@ -4317,6 +4347,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (hadSuccess) reportSuccess(currentApiKey);
             updateCapability(currentApiKey, modelKey, true, 'success');
             recordRequest(model, true, Date.now() - startTime, currentApiKey);
+            try { recordUpstreamSend(currentApiKey, modelKey); } catch {}
             if (!rolePrinted) {
               send({ id, object: 'chat.completion.chunk', created, model,
                 choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
@@ -4400,7 +4431,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             // v2.0.61 (#113) — same policy detection as nonStreamResponse.
             const isPolicyBlocked = /cyber\s*verification|content[\s_-]+policy|policy[\s_-]+(?:violation|blocked|denied)|safety[\s_-]+(?:policy|blocked)|prompt[\s_-]+(?:rejected|blocked)\s+by[\s_-]+policy|usage[\s_-]+policy[\s_-]+violation/i.test(err.message);
             if (isAuthFail) reportError(currentApiKey);
-            if (isRateLimit) { recordRateLimited(); markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
+            if (isRateLimit) { recordRateLimited(); markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); onRateLimitLockout(currentApiKey, modelKey, rateLimitCooldownMs(err.message)); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
             // v2.0.91 — IP-level rate limit circuit breaker (stream path).
             // Same logic as non-stream: ≥3 accounts rate-limited for the
             // same model within 8s → Windsurf is doing IP-wide cooldown,
@@ -4493,6 +4524,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         // All attempts failed
         log.error('Stream error after retries:', lastErr?.message || String(lastErr || 'account queue timed out without an error object'));
         recordRequest(model, false, Date.now() - startTime, currentApiKey);
+        try { recordUpstreamSend(currentApiKey, modelKey); } catch {}
         try {
           const temporaryUnavailable = isAllTemporarilyUnavailable(modelKey);
           const rl = isAllRateLimited(modelKey);

@@ -176,3 +176,30 @@ describe('dashboard batch import proxy binding', () => {
     assert.ok(Array.isArray(legacyA1.availableModels));
   });
 });
+
+describe('GET /quota-windows (quota governor)', () => {
+  it('returns the per-account+model window summary', async () => {
+    const { recordUpstreamSend, _resetForTests } = await import('../src/quota-window.js');
+    _resetForTests();
+    _resetRuntimeConfigForTests();
+    config.dashboardPassword = '';
+    config.apiKey = '';
+    configureBindHost('127.0.0.1');
+
+    recordUpstreamSend('acct-quota-test', 'glm-5.2');
+    recordUpstreamSend('acct-quota-test', 'glm-5.2');
+
+    const res = fakeRes();
+    await handleDashboardApi('GET', '/quota-windows', {}, { headers: {} }, res);
+
+    assert.equal(res.statusCode, 200);
+    const rows = res.json();
+    assert.ok(Array.isArray(rows));
+    const row = rows.find(r => r.modelKey === 'glm-5.2');
+    assert.ok(row, 'glm-5.2 window present');
+    assert.equal(row.count, 2);
+    assert.equal(row.capEstimate, null, 'no cap learned yet');
+    assert.equal(row.live, true);
+    assert.ok(row.windowEndsInMs > 0);
+  });
+});
