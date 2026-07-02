@@ -295,9 +295,14 @@ function userPromptLooksActionable(lastUserText) {
   if (/\b(?:shell|bash|terminal|command|tool|function|file|path)\b/i.test(lastUserText)) return true;
   if (/(?:运行|执行|读取|查看|列出|查找|搜索|获取|修改|编辑|写入|修复|分析|调用|使用|拉取|下载|找到|看一下|看看|检查)/.test(lastUserText)) return true;
   if (/(?:文件|目录|路径|命令|工具|函数|参数|项目|代码|配置)/.test(lastUserText)) return true;
-  // Non-trivial conversational prompts ("continue working", "what's next")
-  // are actionable when the model's narrative shows clear tool intent.
-  if (lastUserText.trim().length >= 10) return true;
+  // Continuation-style prompts ("continue working", "what's next", "go
+  // ahead") delegate the action choice to the model, so a narrative with
+  // clear tool intent should be honored. Deliberately NOT a length
+  // heuristic: a blanket "long prompt = actionable" would defeat the
+  // casual-chat guard this function exists for (e.g. "tell me about your
+  // day" must stay non-actionable).
+  if (/\b(?:continue|proceed|go ahead|keep going|carry on|resume|next step|what'?s next|finish|do it)\b/i.test(lastUserText)) return true;
+  if (/(?:继续|接着|下一步|完成|做吧)/.test(lastUserText)) return true;
   return false;
 }
 
