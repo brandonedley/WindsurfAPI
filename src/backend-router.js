@@ -25,6 +25,11 @@ export const BACKEND = Object.freeze({
   DEVIN_ACP: 'devin-acp',    // Devin CLI ACP over stdio (special-agent, mode=acp)
   DEVIN_PRINT: 'devin-print',// Devin CLI print mode (special-agent, mode=print)
   DEVIN_REST: 'devin-rest',  // Devin DRS REST → api.devin.ai (P2+, not yet wired)
+  GETCHATMESSAGE: 'getchatmessage-native', // cloud ApiServerService/GetChatMessage — TRUE model
+                             // selection (chat_model_uid) + native tools[] on the same
+                             // transport the Devin CLI (chisel) uses. Not Cascade: it
+                             // survives the Cascade decommission. Flag-gated via
+                             // WINDSURFAPI_GETCHATMESSAGE_TOOLS=1.
 });
 
 /**
@@ -63,14 +68,42 @@ function devinOnlyEnabled(env = process.env) {
 }
 
 /**
+ * Native GetChatMessage transport gate. Flag-on + a cascade-uid model + a
+ * tools[] request → serve via the cloud ApiServerService/GetChatMessage
+ * endpoint with a NATIVE tools schema (no prompt emulation). This is the
+ * DEVIN_ONLY known-gap fix: unlike the ACP path (model name is only a prompt
+ * hint; Devin answers with its own SWE core), GetChatMessage carries
+ * chat_model_uid, so the requested model actually serves the request.
+ */
+function getChatMessageToolsEnabled(env = process.env) {
+  return String(env.WINDSURFAPI_GETCHATMESSAGE_TOOLS || '').trim() === '1';
+}
+
+/**
  * Select the backend for a request. Pure function — no I/O, no mutation.
  *
  * @param {object} params
  * @param {object|null} params.modelInfo  resolved model catalog entry
+ * @param {Array|null}  [params.tools]    request tools[] (native transport input)
+ * @param {boolean}     [params.modelSupportsTools] catalog supports_tool_calls
  * @param {object} [params.env]           env source (injectable for tests)
- * @returns {{ backend: string, reason: string, flow: 'special_agent'|'cascade'|'legacy' }}
+ * @returns {{ backend: string, reason: string, flow: 'special_agent'|'cascade'|'legacy'|'getchatmessage' }}
  */
-export function selectBackend({ modelInfo = null, env = process.env } = {}) {
+export function selectBackend({ modelInfo = null, tools = null, modelSupportsTools = false, env = process.env } = {}) {
+  // Native GetChatMessage wins over everything INCLUDING DEVIN_ONLY: it is not
+  // Cascade (survives the decommission) and it does true model selection —
+  // exactly what DEVIN_ONLY's ACP path cannot do (see known-gap note below).
+  if (getChatMessageToolsEnabled(env)
+    && modelSupportsTools
+    && Array.isArray(tools) && tools.length > 0
+    && modelInfo?.modelUid && !isSpecialAgentInfo(modelInfo)) {
+    return {
+      backend: BACKEND.GETCHATMESSAGE,
+      reason: 'getchatmessage_tools_flag',
+      flow: 'getchatmessage',
+    };
+  }
+
   // DEVIN_ONLY: Cascade is retired — force every request onto Devin. This wins
   // over all model-based routing below. The sub-mode (acp/print) still comes
   // from DEVIN_CLI_MODE so the existing runner selection is preserved.

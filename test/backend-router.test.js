@@ -133,3 +133,61 @@ describe('backend-router selectBackend — DEVIN_ONLY (Cascade retired)', () => 
     assert.equal(padded.flow, 'special_agent');
   });
 });
+
+// ─── GETCHATMESSAGE backend (native tool transport) ────────────────
+// Flag-on + cascade-uid model + tools[] + catalog tool support → the cloud
+// ApiServerService/GetChatMessage transport. This is the DEVIN_ONLY known-gap
+// fix: GetChatMessage carries chat_model_uid (true model selection) where the
+// ACP path only passes the model name as a prompt hint.
+
+describe('backend-router selectBackend — GETCHATMESSAGE gating', () => {
+  const glm = { modelUid: 'glm-5-2' };
+  const tools = [{ type: 'function', function: { name: 'exec' } }];
+  const flagOn = { WINDSURFAPI_GETCHATMESSAGE_TOOLS: '1' };
+
+  it('flag + uid + tools + support → getchatmessage-native', () => {
+    const sel = selectBackend({ modelInfo: glm, tools, modelSupportsTools: true, env: flagOn });
+    assert.equal(sel.backend, BACKEND.GETCHATMESSAGE);
+    assert.equal(sel.flow, 'getchatmessage');
+    assert.equal(usesCascadeFlow(sel), false);
+  });
+
+  it('flag off → cascade (legacy parity preserved)', () => {
+    const sel = selectBackend({ modelInfo: glm, tools, modelSupportsTools: true, env: {} });
+    assert.equal(sel.backend, BACKEND.CASCADE);
+  });
+
+  it('no tools[] → cascade even with the flag on', () => {
+    for (const t of [null, undefined, []]) {
+      const sel = selectBackend({ modelInfo: glm, tools: t, modelSupportsTools: true, env: flagOn });
+      assert.equal(sel.backend, BACKEND.CASCADE, `tools=${JSON.stringify(t)}`);
+    }
+  });
+
+  it('catalog says no tool support → cascade even with the flag on', () => {
+    const sel = selectBackend({ modelInfo: glm, tools, modelSupportsTools: false, env: flagOn });
+    assert.equal(sel.backend, BACKEND.CASCADE);
+  });
+
+  it('wins over DEVIN_ONLY (true model selection beats the prompt-hint gap)', () => {
+    const sel = selectBackend({
+      modelInfo: glm, tools, modelSupportsTools: true,
+      env: { ...flagOn, DEVIN_ONLY: '1' },
+    });
+    assert.equal(sel.backend, BACKEND.GETCHATMESSAGE);
+  });
+
+  it('special_agent models are never routed to getchatmessage', () => {
+    const sel = selectBackend({
+      modelInfo: { backend: 'special_agent', modelUid: 'swe-1.6' },
+      tools, modelSupportsTools: true, env: flagOn,
+    });
+    assert.equal(sel.flow, 'special_agent');
+  });
+
+  it('DEVIN_ONLY still forces devin for non-tool requests when the flag is on', () => {
+    const sel = selectBackend({ modelInfo: glm, tools: [], modelSupportsTools: true, env: { ...flagOn, DEVIN_ONLY: '1' } });
+    assert.equal(sel.flow, 'special_agent');
+    assert.equal(sel.reason, 'devin_only');
+  });
+});

@@ -38,7 +38,7 @@ import {
 import {
   handleSpecialAgentChatCompletion,
 } from '../special-agent.js';
-import { selectBackend, usesCascadeFlow } from '../backend-router.js';
+import { selectBackend, usesCascadeFlow, BACKEND } from '../backend-router.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 import { registerSseController } from '../sse-registry.js';
 import { prepareHermesDevinRequest } from '../hermes-devin/adapter.js';
@@ -81,16 +81,21 @@ const IP_RATE_LIMIT_BURST_FLOOR_MS = 30_000;
  * @returns {boolean}
  */
 export function shouldRouteGetChatMessageTools({ env = process.env, modelKey = '', tools } = {}) {
-  if (!env || env.WINDSURFAPI_GETCHATMESSAGE_TOOLS !== '1') return false;
-  if (!Array.isArray(tools) || tools.length === 0) return false;
-  if (!supportsToolCalls(modelKey)) return false;
-  // supportsToolCalls only checks for a modelUid, which deprecated and
-  // special-agent models (adaptive, arena-fast, arena-smart) also carry. The
-  // cloud ApiServerService does not treat those as tool-capable inference
-  // endpoints — they have their own routing — so exclude them here.
+  // The decision itself lives in backend-router.selectBackend (the multi-
+  // backend seam); this wrapper only resolves the catalog inputs it needs.
+  // Deprecated models keep a modelUid but the cloud ApiServerService does not
+  // treat them as tool-capable inference endpoints, so exclude them here
+  // (the special_agent exclusion is the router's job).
+  if (!env) return false;
   const info = getModelInfo(modelKey);
-  if (info && (info.deprecated || info.backend === 'special_agent')) return false;
-  return true;
+  if (info?.deprecated) return false;
+  const sel = selectBackend({
+    modelInfo: info,
+    tools,
+    modelSupportsTools: supportsToolCalls(modelKey),
+    env,
+  });
+  return sel.backend === BACKEND.GETCHATMESSAGE;
 }
 
 /**
