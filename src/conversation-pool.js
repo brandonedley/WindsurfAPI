@@ -317,7 +317,11 @@ function projectAssistantToolCalls(m) {
 function projectMessage(m) {
   const role = m?.role;
   if (role === 'system') {
-    const blocks = canonicaliseContent(m.content);
+    const blocks = canonicaliseContent(m.content).map(b => (
+      b?.type === 'text' && typeof b.text === 'string'
+        ? { ...b, text: normalizeSystemPromptForHash(b.text) }
+        : b
+    ));
     return { role: 'system', content: blocks };
   }
   if (role === 'user') {
