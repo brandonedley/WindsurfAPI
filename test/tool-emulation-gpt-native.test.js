@@ -56,9 +56,24 @@ describe('pickToolDialect — gpt_native gating (v2.0.62 #115)', () => {
     }
   });
 
-  it('invalid WINDSURFAPI_FORCE_GLM_DIALECT falls back to glm47', () => {
+  it('invalid WINDSURFAPI_FORCE_GLM_DIALECT falls back to the per-model default', () => {
     const orig = process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
     process.env.WINDSURFAPI_FORCE_GLM_DIALECT = 'not_a_dialect';
+    try {
+      // older GLM default: glm47
+      assert.equal(pickToolDialect('glm-4.7', 'zhipu', 'chat'), 'glm47');
+      // glm-5.2 default: gpt_native (v2.0.72 probe — glm-5.2 ignores glm47
+      // markup; an invalid override must not mask the hardcoded default)
+      assert.equal(pickToolDialect('glm-5.2', 'zhipu', 'chat'), 'gpt_native');
+    } finally {
+      if (orig === undefined) delete process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+      else process.env.WINDSURFAPI_FORCE_GLM_DIALECT = orig;
+    }
+  });
+
+  it('explicit WINDSURFAPI_FORCE_GLM_DIALECT wins over the glm-5.2 hardcode', () => {
+    const orig = process.env.WINDSURFAPI_FORCE_GLM_DIALECT;
+    process.env.WINDSURFAPI_FORCE_GLM_DIALECT = 'glm47';
     try {
       assert.equal(pickToolDialect('glm-5.2', 'zhipu', 'chat'), 'glm47');
     } finally {
