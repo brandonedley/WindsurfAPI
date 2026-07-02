@@ -454,3 +454,71 @@ test('native route propagates finish_reason=length through SSE on a max-tokens t
     else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
   }
 });
+
+// ─── Phase 1: native route feeds dashboard stats ──────────────────
+// The native GetChatMessage route carried ~all agent traffic but never called
+// recordRequest/recordTokenUsage/recordRateLimited — stats.json showed 26
+// lifetime requests while the account had been rate-limit-marked 21 times.
+// The dashboard must see native traffic like it sees legacy traffic.
+
+test('native route success records model/account stats and token usage', async () => {
+  const { getStats } = await import('../src/dashboard/stats.js');
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    const before = getStats();
+    const beforeReq = before.modelCounts['glm-5.2']?.requests || 0;
+    const beforeOk = before.modelCounts['glm-5.2']?.success || 0;
+    const beforeUsage = before.tokenTotals?.requests_with_usage || 0;
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+      __nativeToolsTransport: async () => ({
+        text: 'native stats ok', stopReason: 2, toolCalls: [], openaiToolCalls: [],
+      }),
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'x' }], tools },
+      ctx,
+    );
+    assert.equal(res.status, 200);
+    const after = getStats();
+    assert.equal(after.modelCounts['glm-5.2'].requests, beforeReq + 1, 'recordRequest fired');
+    assert.equal(after.modelCounts['glm-5.2'].success, beforeOk + 1, 'counted as success');
+    assert.equal(after.tokenTotals.requests_with_usage, beforeUsage + 1, 'recordTokenUsage fired');
+  } finally {
+    if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});
+
+test('native route rate-limit records error + rateLimitedCount', async () => {
+  const { getStats } = await import('../src/dashboard/stats.js');
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    const before = getStats();
+    const beforeErr = before.modelCounts['glm-5.2']?.errors || 0;
+    const beforeRl = before.rateLimitedCount || 0;
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+      __nativeToolsTransport: async () => {
+        const e = new Error('GetChatMessage error trailer: permission_denied Reached message rate limit for this model. Please try again later. Resets in: 3h0m0s');
+        e.errorTrailer = { error: { code: 'permission_denied', message: 'Reached message rate limit for this model. Please try again later. Resets in: 3h0m0s' } };
+        throw e;
+      },
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'x' }], tools },
+      ctx,
+    );
+    assert.equal(res.status, 429);
+    const after = getStats();
+    assert.equal(after.modelCounts['glm-5.2'].errors, beforeErr + 1, 'recordRequest(false) fired');
+    assert.equal(after.rateLimitedCount, beforeRl + 1, 'recordRateLimited fired');
+  } finally {
+    if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});

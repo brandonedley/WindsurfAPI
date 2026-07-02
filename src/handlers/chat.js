@@ -1871,6 +1871,11 @@ async function _handleChatCompletionsInner(body, context = {}) {
         nativeAcct = await waitForAccountFn(triedNative, context.signal, undefined, nativeRouteModelKey, callerKey);
       }
       if (nativeAcct) {
+        // Dashboard stats parity with the legacy paths: the native route
+        // carries the bulk of agent traffic (agents always send tools[]), so
+        // it must feed recordRequest/recordTokenUsage or stats.json blindly
+        // under-reports exactly the traffic that burns rate-limit windows.
+        const nativeStart = Date.now();
         try {
           const parsed = await transport({
             account: { apiKey: nativeAcct.apiKey, apiServerUrl: nativeAcct.apiServerUrl },
@@ -1894,6 +1899,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
               usage: buildUsageBody(null, messages, choice.message.content || ''),
             },
           };
+          try {
+            recordRequest(nativeRouteModelKey, true, Date.now() - nativeStart, nativeAcct.apiKey);
+            recordTokenUsage(nativeResult.body.usage);
+          } catch {}
           // Honor the client's stream flag. Agents (Hermes) send stream:true and
           // expect text/event-stream; returning a plain JSON body violates the
           // SSE contract, breaks their client, and trips fallback_providers off
@@ -1928,11 +1937,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
             || rlCooldownMs != null
             || /reached message rate limit|rate[\s-]?limit|too many requests/i.test(err?.message || '');
           try {
-            if (isRateLimit) markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || rlCooldownMs || 60000, nativeRouteModelKey);
+            if (isRateLimit) { markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || rlCooldownMs || 60000, nativeRouteModelKey); recordRateLimited(); }
             else if (err?.status === 401 || err?.status === 403) reportError(nativeAcct.apiKey);
             else if (!isUpstreamModelTrailer && (!err?.status || err.status >= 500)) reportInternalError(nativeAcct.apiKey);
             // else: transient upstream model trailer — retryable, no penalty.
           } catch {}
+          try { recordRequest(nativeRouteModelKey, false, Date.now() - nativeStart, nativeAcct.apiKey); } catch {}
           if (isRateLimit) {
             const retryMs = err?.retryAfterMs || rlCooldownMs || 60000;
             const retryAfterSec = Math.max(1, Math.ceil(retryMs / 1000));
