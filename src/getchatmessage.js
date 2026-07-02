@@ -50,7 +50,51 @@ export const SOURCE = {
 
 export const REQUEST_TYPE_CASCADE = 5;
 export const PLANNER_MODE = 1;
-export const STOP_REASON_TOOL_USE = 10;
+
+// Authoritative `exa.codeium_common_pb.StopReason` enum, extracted from the
+// language-server FileDescriptorProto and cross-checked against live captures:
+// a tool turn ends with FUNCTION_CALL=10 (capture/replay_ok.bin), a normal text
+// turn with STOP_PATTERN=2 (live devin glm-5-2 capture). This is the field-5
+// (`stop_reason`) value the response parser reads at getchatmessage.js:392.
+export const STOP_REASON = {
+  UNSPECIFIED: 0,
+  INCOMPLETE: 1,
+  STOP_PATTERN: 2,
+  MAX_TOKENS: 3,
+  MIN_LOG_PROB: 4,
+  MAX_NEWLINES: 5,
+  EXIT_SCOPE: 6,
+  NONFINITE_LOGIT_OR_PROB: 7,
+  FIRST_NON_WHITESPACE_LINE: 8,
+  PARTIAL: 9,
+  FUNCTION_CALL: 10,
+  CONTENT_FILTER: 11,
+  NON_INSERTION: 12,
+  ERROR: 13,
+};
+
+// Back-compat alias: the tool-use sentinel callers already key off.
+export const STOP_REASON_TOOL_USE = STOP_REASON.FUNCTION_CALL;
+
+/**
+ * Map a GetChatMessage `stop_reason` to an OpenAI `finish_reason` for a
+ * NON-tool turn. Tool-call turns are decided by the caller (driven by the
+ * presence of parsed tool_calls), so FUNCTION_CALL is intentionally not
+ * special-cased here — when there are no tool_calls it falls through to 'stop'.
+ *   MAX_TOKENS(3)      -> 'length'          (genuine truncation)
+ *   CONTENT_FILTER(11) -> 'content_filter'
+ *   everything else    -> 'stop'
+ */
+export function stopReasonToFinishReason(stopReason) {
+  switch (stopReason) {
+    case STOP_REASON.MAX_TOKENS:
+      return 'length';
+    case STOP_REASON.CONTENT_FILTER:
+      return 'content_filter';
+    default:
+      return 'stop';
+  }
+}
 
 // ─── Template blobs (carried verbatim from the proven request) ──
 //

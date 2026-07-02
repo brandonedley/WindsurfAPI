@@ -5,6 +5,7 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError, getChatMessageWithTools } from '../client.js';
+import { STOP_REASON, stopReasonToFinishReason } from '../getchatmessage.js';
 import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary } from '../auth.js';
 import { isStickyEnabled, setStickyBinding } from '../account/sticky-session.js';
 import { resolveModel, getModelInfo, pickRateLimitFallback, supportsToolCalls } from '../models.js';
@@ -124,7 +125,7 @@ export function mapGetChatMessageResultToChoice(parsed, tools) {
   }));
 
   const hasToolCalls = openaiToolCalls.length > 0;
-  const isToolUse = parsed.stopReason === 10 || hasToolCalls;
+  const isToolUse = parsed.stopReason === STOP_REASON.FUNCTION_CALL || hasToolCalls;
 
   if (isToolUse && hasToolCalls) {
     return {
@@ -133,10 +134,13 @@ export function mapGetChatMessageResultToChoice(parsed, tools) {
       finish_reason: 'tool_calls',
     };
   }
+  // Non-tool turn: map the authoritative stop_reason so a genuine max-tokens
+  // truncation surfaces as finish_reason 'length' (not a silent 'stop') and a
+  // content-filter stop surfaces as 'content_filter'. Everything else -> 'stop'.
   return {
     index: 0,
     message: { role: 'assistant', content: parsed.text || '' },
-    finish_reason: 'stop',
+    finish_reason: stopReasonToFinishReason(parsed.stopReason),
   };
 }
 
@@ -1909,16 +1913,39 @@ async function _handleChatCompletionsInner(body, context = {}) {
           // actually being rate-limited) or an auth failure should affect pool
           // health; a transient trailer is just a retryable error.
           const isUpstreamModelTrailer = !!err?.errorTrailer;
+          // A per-model MESSAGE RATE LIMIT arrives as a connect+proto error
+          // trailer ("permission_denied Reached message rate limit ... Resets
+          // in: 41m") on an HTTP 200 response, so err.status is NOT 429. If we
+          // lump it in with benign transient trailers we (a) never call
+          // markRateLimited, so getApiKey (auth.js:795) keeps handing back the
+          // cooled-down account and every subsequent request re-hits upstream,
+          // burning another message against the same window — the bug behind
+          // the 150+ rate-limit hits per reset window; and (b) return 502 so
+          // Hermes retries 3x against the wall instead of failing over. Detect
+          // the rate-limit trailer explicitly and treat it as a real 429.
+          const rlCooldownMs = parseRateLimitCooldownMs(err?.message);
+          const isRateLimit = err?.status === 429
+            || rlCooldownMs != null
+            || /reached message rate limit|rate[\s-]?limit|too many requests/i.test(err?.message || '');
           try {
-            if (err?.status === 429) markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || 60000, nativeRouteModelKey);
+            if (isRateLimit) markRateLimited(nativeAcct.apiKey, err?.retryAfterMs || rlCooldownMs || 60000, nativeRouteModelKey);
             else if (err?.status === 401 || err?.status === 403) reportError(nativeAcct.apiKey);
             else if (!isUpstreamModelTrailer && (!err?.status || err.status >= 500)) reportInternalError(nativeAcct.apiKey);
             // else: transient upstream model trailer — retryable, no penalty.
           } catch {}
-          const status = err?.status === 429 ? 429 : (err?.status && err.status >= 400 && err.status < 500 ? err.status : 502);
+          if (isRateLimit) {
+            const retryMs = err?.retryAfterMs || rlCooldownMs || 60000;
+            const retryAfterSec = Math.max(1, Math.ceil(retryMs / 1000));
+            return {
+              status: 429,
+              headers: { 'Retry-After': String(retryAfterSec) },
+              body: { error: { message: err.message, type: 'rate_limit_exceeded', retry_after_ms: retryMs } },
+            };
+          }
+          const status = err?.status && err.status >= 400 && err.status < 500 ? err.status : 502;
           return {
             status,
-            body: { error: { message: err.message, type: status === 429 ? 'rate_limit_exceeded' : 'upstream_error' } },
+            body: { error: { message: err.message, type: 'upstream_error' } },
           };
         } finally {
           try { releaseAccount(nativeAcct.apiKey); } catch {}

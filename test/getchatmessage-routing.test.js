@@ -73,6 +73,47 @@ test('maps a text-only result to finish_reason=stop with content', () => {
   assert.equal(choice.message.tool_calls, undefined);
 });
 
+// stop_reason -> finish_reason mapping (authoritative codeium_common.StopReason
+// enum, confirmed against live captures: STOP_PATTERN=2 on a real text turn,
+// FUNCTION_CALL=10 on a real tool turn). A genuine max-tokens truncation must
+// not be silently reported as a normal 'stop'.
+test('maps STOP_REASON_MAX_TOKENS(3) to finish_reason=length', () => {
+  const parsed = { text: 'partial answer that got cut', stopReason: 3, toolCalls: [], openaiToolCalls: [] };
+  const choice = mapGetChatMessageResultToChoice(parsed);
+  assert.equal(choice.finish_reason, 'length');
+  assert.equal(choice.message.content, 'partial answer that got cut');
+});
+
+test('maps STOP_REASON_CONTENT_FILTER(11) to finish_reason=content_filter', () => {
+  const parsed = { text: '', stopReason: 11, toolCalls: [], openaiToolCalls: [] };
+  const choice = mapGetChatMessageResultToChoice(parsed);
+  assert.equal(choice.finish_reason, 'content_filter');
+});
+
+test('maps STOP_REASON_STOP_PATTERN(2) (normal text end) to finish_reason=stop', () => {
+  // value observed on the live devin glm-5-2 text-completion capture
+  const parsed = { text: 'done.', stopReason: 2, toolCalls: [], openaiToolCalls: [] };
+  assert.equal(mapGetChatMessageResultToChoice(parsed).finish_reason, 'stop');
+});
+
+test('unmapped/other stop_reasons fall through to stop, and null is safe', () => {
+  for (const sr of [0, 5, 6, 7, 8, 9, 12, 13, null, undefined]) {
+    const choice = mapGetChatMessageResultToChoice({ text: 'x', stopReason: sr, toolCalls: [], openaiToolCalls: [] });
+    assert.equal(choice.finish_reason, 'stop', `stopReason=${sr} should map to stop`);
+  }
+});
+
+test('tool_calls take precedence over a length stop_reason (FUNCTION_CALL turn)', () => {
+  // defensive: if both a tool call and a non-tool stop_reason are present, the
+  // tool-call branch wins (a turn that emitted a call is finish_reason=tool_calls)
+  const parsed = {
+    text: '', stopReason: 3,
+    toolCalls: [{ id: 't1', name: 'exec', argumentsJson: '{}' }],
+  };
+  const choice = mapGetChatMessageResultToChoice(parsed, tools);
+  assert.equal(choice.finish_reason, 'tool_calls');
+});
+
 test('handler routes through the native transport when flag+capability+tools (mock transport)', async () => {
   const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
   process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
@@ -200,6 +241,40 @@ test('handler returns a clean error on native transport failure (no legacy fallt
     );
     assert.equal(res.status, 429);
     assert.equal(res.body.error.type, 'rate_limit_exceeded');
+  } finally {
+    if (prev === undefined) delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+    else process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+  }
+});
+
+test('native route maps an upstream rate-limit TRAILER (no http status) to 429 + Retry-After', async () => {
+  // Windsurf surfaces a per-model message rate limit as a connect+proto error
+  // trailer on an HTTP 200 response, so err.status is undefined. Regression:
+  // this was misclassified as a benign transient trailer → 502 (which Hermes
+  // retries 3x) and markRateLimited never fired (so the cooled-down account
+  // was re-handed out and every request re-hit upstream). Must become a 429.
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+      __nativeToolsTransport: async () => {
+        const e = new Error('GetChatMessage error trailer: permission_denied Reached message rate limit for this model. Please try again later. Resets in: 41m32s');
+        e.errorTrailer = { error: { code: 'permission_denied', message: 'Reached message rate limit for this model. Please try again later. Resets in: 41m32s' } };
+        // NOTE: no e.status — this is the trailer case, HTTP was 200.
+        throw e;
+      },
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'x' }], tools },
+      ctx,
+    );
+    assert.equal(res.status, 429, 'rate-limit trailer must map to 429, not 502');
+    assert.equal(res.body.error.type, 'rate_limit_exceeded');
+    assert.ok(res.headers && res.headers['Retry-After'], 'must set Retry-After header');
+    // 41m32s = 2492000ms
+    assert.equal(res.body.error.retry_after_ms, 2492000, 'parses the "Resets in" window');
   } finally {
     if (prev === undefined) delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
     else process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
@@ -344,6 +419,36 @@ test('native route honors stream:true => SSE chunks with tool_calls + [DONE]', a
     assert.match(out, /exec/, 'streams the tool call');
     assert.match(out, /"finish_reason":"tool_calls"/, 'final chunk has tool_calls finish_reason');
     assert.match(out, /data: \[DONE\]/, 'terminates with [DONE]');
+  } finally {
+    if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});
+
+test('native route propagates finish_reason=length through SSE on a max-tokens truncation', async () => {
+  const prev = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+      // stopReason 3 = STOP_REASON_MAX_TOKENS, no tool calls => genuine truncation
+      __nativeToolsTransport: async () => ({
+        text: 'this answer was cut off because it hit the', stopReason: 3,
+        toolCalls: [], openaiToolCalls: [],
+      }),
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', stream: true, messages: [{ role: 'user', content: 'x' }], tools },
+      ctx,
+    );
+    assert.equal(res.stream, true);
+    let out = '';
+    const fakeRes = { writableEnded: false, write(s) { out += s; }, end() { this.writableEnded = true; } };
+    await res.handler(fakeRes);
+    assert.match(out, /"finish_reason":"length"/, 'final chunk reports length, not a silent stop');
+    assert.doesNotMatch(out, /"finish_reason":"stop"/, 'must not mislabel a truncation as stop');
+    assert.match(out, /data: \[DONE\]/);
   } finally {
     if (prev !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prev;
     else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
