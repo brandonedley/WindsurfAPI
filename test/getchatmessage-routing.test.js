@@ -522,3 +522,61 @@ test('native route rate-limit records error + rateLimitedCount', async () => {
     else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
   }
 });
+
+// ─── Phase 4: WINDSURFAPI_GETCHATMESSAGE_ALL (no-tools chat) ───────
+// Cascade independence: with both flags on, a plain no-tools chat on a
+// cascade-uid model rides the native transport (empty tools[] is already
+// supported by the encoder; live-validated text turn: stopReason=2 → 'stop').
+
+test('ALL flag routes a NO-tools request through the native transport', async () => {
+  const prevTools = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  const prevAll = process.env.WINDSURFAPI_GETCHATMESSAGE_ALL;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  process.env.WINDSURFAPI_GETCHATMESSAGE_ALL = '1';
+  try {
+    let sawTools = 'unset';
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => ({ apiKey: 'devin-tok', apiServerUrl: 'https://server.codeium.com' }),
+      __nativeToolsTransport: async ({ tools: t }) => {
+        sawTools = t;
+        return { text: 'plain chat answer', stopReason: 2, toolCalls: [], openaiToolCalls: [] };
+      },
+    };
+    const res = await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'hi there' }] },
+      ctx,
+    );
+    assert.equal(res.status, 200);
+    assert.equal(res.body.choices[0].message.content, 'plain chat answer');
+    assert.equal(res.body.choices[0].finish_reason, 'stop');
+    assert.ok(!Array.isArray(sawTools) || sawTools.length === 0, 'no tools passed to transport');
+  } finally {
+    if (prevTools !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prevTools;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+    if (prevAll !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_ALL = prevAll;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_ALL;
+  }
+});
+
+test('without ALL, a no-tools request does NOT touch the native transport', async () => {
+  const prevTools = process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = '1';
+  try {
+    let transportCalled = false;
+    const ctx = {
+      callerKey: 'k',
+      getApiKey: () => null, // legacy path account acquisition fails fast
+      __nativeToolsTransport: async () => { transportCalled = true; return { text: 'x', stopReason: 2, toolCalls: [], openaiToolCalls: [] }; },
+      waitForAccount: async () => null,
+    };
+    await handleChatCompletions(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'hi' }] },
+      ctx,
+    );
+    assert.equal(transportCalled, false, 'native transport must not engage without tools[] or ALL');
+  } finally {
+    if (prevTools !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prevTools;
+    else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
+  }
+});

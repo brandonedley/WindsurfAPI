@@ -191,3 +191,46 @@ describe('backend-router selectBackend — GETCHATMESSAGE gating', () => {
     assert.equal(sel.reason, 'devin_only');
   });
 });
+
+// ─── GETCHATMESSAGE_ALL: Cascade independence for no-tools chat ─────
+// WINDSURFAPI_GETCHATMESSAGE_ALL=1 widens the native transport to requests
+// WITHOUT tools[], so cascade-uid models keep working when the Cascade
+// upstream is decommissioned. Requires the base TOOLS flag (the transport
+// switch); ALL alone does nothing.
+
+describe('backend-router selectBackend — GETCHATMESSAGE_ALL gating', () => {
+  const glm = { modelUid: 'glm-5-2' };
+  const bothFlags = { WINDSURFAPI_GETCHATMESSAGE_TOOLS: '1', WINDSURFAPI_GETCHATMESSAGE_ALL: '1' };
+
+  it('both flags + uid + NO tools → getchatmessage-native', () => {
+    for (const t of [null, undefined, []]) {
+      const sel = selectBackend({ modelInfo: glm, tools: t, modelSupportsTools: true, env: bothFlags });
+      assert.equal(sel.backend, BACKEND.GETCHATMESSAGE, `tools=${JSON.stringify(t)}`);
+      assert.equal(sel.flow, 'getchatmessage');
+    }
+  });
+
+  it('ALL without the base TOOLS flag → cascade (transport switch stays off)', () => {
+    const sel = selectBackend({
+      modelInfo: glm, tools: [], modelSupportsTools: true,
+      env: { WINDSURFAPI_GETCHATMESSAGE_ALL: '1' },
+    });
+    assert.equal(sel.backend, BACKEND.CASCADE);
+  });
+
+  it('ALL still excludes special_agent models', () => {
+    const sel = selectBackend({
+      modelInfo: { backend: 'special_agent', modelUid: 'swe-1.6' },
+      tools: [], modelSupportsTools: true, env: bothFlags,
+    });
+    assert.equal(sel.flow, 'special_agent');
+  });
+
+  it('ALL wins over DEVIN_ONLY for cascade-uid models (model selection preserved)', () => {
+    const sel = selectBackend({
+      modelInfo: glm, tools: [], modelSupportsTools: true,
+      env: { ...bothFlags, DEVIN_ONLY: '1' },
+    });
+    assert.equal(sel.backend, BACKEND.GETCHATMESSAGE);
+  });
+});

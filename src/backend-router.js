@@ -80,6 +80,17 @@ function getChatMessageToolsEnabled(env = process.env) {
 }
 
 /**
+ * WINDSURFAPI_GETCHATMESSAGE_ALL=1 widens the native transport to requests
+ * WITHOUT tools[] (plain chat), making cascade-uid models fully independent
+ * of the Cascade upstream before its decommission. The empty-tools request is
+ * already supported by the encoder (live-validated text turn: stop_reason=2).
+ * Requires the base TOOLS flag — ALL widens the transport, it does not enable it.
+ */
+function getChatMessageAllEnabled(env = process.env) {
+  return String(env.WINDSURFAPI_GETCHATMESSAGE_ALL || '').trim() === '1';
+}
+
+/**
  * Select the backend for a request. Pure function — no I/O, no mutation.
  *
  * @param {object} params
@@ -95,11 +106,11 @@ export function selectBackend({ modelInfo = null, tools = null, modelSupportsToo
   // exactly what DEVIN_ONLY's ACP path cannot do (see known-gap note below).
   if (getChatMessageToolsEnabled(env)
     && modelSupportsTools
-    && Array.isArray(tools) && tools.length > 0
+    && ((Array.isArray(tools) && tools.length > 0) || getChatMessageAllEnabled(env))
     && modelInfo?.modelUid && !isSpecialAgentInfo(modelInfo)) {
     return {
       backend: BACKEND.GETCHATMESSAGE,
-      reason: 'getchatmessage_tools_flag',
+      reason: (Array.isArray(tools) && tools.length > 0) ? 'getchatmessage_tools_flag' : 'getchatmessage_all_flag',
       flow: 'getchatmessage',
     };
   }
