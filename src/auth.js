@@ -26,6 +26,28 @@ import { join } from 'path';
 // one replica survive future restarts and are visible to every replica.
 // See `src/config.js` (sharedDataDir vs dataDir) and issue #67.
 const ACCOUNTS_FILE = join(config.sharedDataDir || config.dataDir, 'accounts.json');
+// Self-heal backup. accounts.json has been observed getting emptied to `[]`
+// out-of-band (NOT via removeAccount — its "Account removed" log never fired —
+// so the in-memory pool was never cleared by us; the file is truncated by
+// something outside the normal save path). We mirror every NON-EMPTY save to a
+// sibling `.bak` and recover from it on startup when accounts.json loads empty,
+// so a wipe survives a restart instead of silently logging out the pool.
+const ACCOUNTS_BAK = `${ACCOUNTS_FILE}.bak`;
+
+// Mirror a known-good (non-empty) account snapshot to ACCOUNTS_BAK. Best-effort:
+// a backup failure must never block or fail the primary save. We deliberately
+// only mirror NON-EMPTY states — an empty accounts.json is either a legitimate
+// "removed the last account" (removeAccount clears the bak explicitly for that
+// case) or the out-of-band wipe we are guarding against, and in the latter case
+// keeping the last non-empty backup is what makes recovery possible.
+function _mirrorAccountsBak(serialized) {
+  if (!Array.isArray(serialized) || serialized.length === 0) return;
+  try {
+    const tmp = `${ACCOUNTS_BAK}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(serialized, null, 2));
+    renameSyncWithRetry(tmp, ACCOUNTS_BAK);
+  } catch { /* best-effort */ }
+}
 
 // ─── Account pool ──────────────────────────────────────────
 
@@ -255,8 +277,10 @@ function saveAccounts() {
     // mid-write cannot leave accounts.json truncated/corrupt. The unique
     // tmp also prevents concurrent test/process saves from racing on the
     // same `${ACCOUNTS_FILE}.tmp` name.
-    writeFileSync(tempFile, JSON.stringify(_serializeAccounts(), null, 2));
+    const snapshot = _serializeAccounts();
+    writeFileSync(tempFile, JSON.stringify(snapshot, null, 2));
     renameSyncWithRetry(tempFile, ACCOUNTS_FILE);
+    _mirrorAccountsBak(snapshot);
   } catch (e) {
     log.error('Failed to save accounts:', e.message);
     try { unlinkSync(tempFile); } catch {}
@@ -276,8 +300,10 @@ function saveAccounts() {
 export function saveAccountsSync() {
   const tempFile = `${ACCOUNTS_FILE}.${process.pid}.shutdown.tmp`;
   try {
-    writeFileSync(tempFile, JSON.stringify(_serializeAccounts(), null, 2));
+    const snapshot = _serializeAccounts();
+    writeFileSync(tempFile, JSON.stringify(snapshot, null, 2));
     renameSyncWithRetry(tempFile, ACCOUNTS_FILE);
+    _mirrorAccountsBak(snapshot);
   } catch (e) {
     log.error('Shutdown: failed to flush accounts:', e.message);
     try { unlinkSync(tempFile); } catch {}
@@ -331,14 +357,37 @@ export function migrateReplicaAccountsTo({ sharedDir, accountsFile, logger = log
   }
 }
 
+// Pure, testable: decide which account data to load. Reads `accountsFile`,
+// tolerating missing/corrupt/empty; if it yields no accounts but `bakFile` holds
+// a non-empty snapshot, recover from the backup (the out-of-band wipe guard).
+// Returns { data: array|null, recovered: boolean }.
+export function recoverAccountsData({ accountsFile, bakFile, logger = log }) {
+  let data = null;
+  if (accountsFile && existsSync(accountsFile)) {
+    try { data = JSON.parse(readFileSync(accountsFile, 'utf-8')); } catch { data = null; }
+  }
+  let recovered = false;
+  if ((!Array.isArray(data) || data.length === 0) && bakFile && existsSync(bakFile)) {
+    try {
+      const bak = JSON.parse(readFileSync(bakFile, 'utf-8'));
+      if (Array.isArray(bak) && bak.length > 0) {
+        logger.warn?.(`accounts.json was empty/missing but ${bak.length} account(s) found in ${bakFile} — RECOVERING. Something emptied accounts.json out-of-band (not removeAccount); investigate the writer.`);
+        data = bak;
+        recovered = true;
+      }
+    } catch { /* corrupt backup — fall through */ }
+  }
+  return { data: Array.isArray(data) ? data : null, recovered };
+}
+
 function loadAccounts() {
   try {
     migrateReplicaAccountsTo({
       sharedDir: config.sharedDataDir || config.dataDir,
       accountsFile: ACCOUNTS_FILE,
     });
-    if (!existsSync(ACCOUNTS_FILE)) return;
-    const data = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    const { data, recovered } = recoverAccountsData({ accountsFile: ACCOUNTS_FILE, bakFile: ACCOUNTS_BAK });
+    if (!data) return;
     for (const a of data) {
       if (accounts.find(x => x.apiKey === a.apiKey)) continue;
       accounts.push({
@@ -360,7 +409,9 @@ function loadAccounts() {
         userStatusLastFetched: a.userStatusLastFetched || 0,
       });
     }
-    if (data.length > 0) log.info(`Loaded ${data.length} account(s) from disk`);
+    if (data.length > 0) log.info(`Loaded ${data.length} account(s) from disk${recovered ? ' (recovered from backup)' : ''}`);
+    // Rewrite accounts.json from the recovered state so the file is whole again.
+    if (recovered) saveAccounts();
   } catch (e) {
     log.error('Failed to load accounts:', e.message);
   }
@@ -663,6 +714,12 @@ export function removeAccount(id) {
   if (idx === -1) return false;
   const account = accounts[idx];
   accounts.splice(idx, 1);
+  // A deliberate removal of the LAST account is the one legitimate way to reach
+  // an empty pool. Drop the self-heal backup so the next restart doesn't
+  // resurrect the just-deleted account from .bak. (Any non-empty save rewrites
+  // the bak, so partial removals stay backed up.)
+  if (accounts.length === 0) { try { unlinkSync(ACCOUNTS_BAK); } catch { /* no bak */ } }
+  log.warn(`removeAccount(${id}) — pool now has ${accounts.length} account(s) [${safeAccountRef(account)}]`);
   saveAccounts();
   // Drop any Cascade conversations owned by this key so future requests
   // don't try to resume on an account that no longer exists.

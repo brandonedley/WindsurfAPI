@@ -1,9 +1,24 @@
-import { readFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, mkdtempSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { tmpdir } from 'os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
+
+// Test isolation (CRITICAL): a `node --test` run imports this module, which
+// resolves ACCOUNTS_FILE from DATA_DIR. Without this guard DATA_DIR comes from
+// the real .env (~/.windsurf), so ANY test that triggers saveAccounts() (and
+// many do, via the empty test-process pool) overwrites the PRODUCTION
+// accounts.json with `[]` — silently logging the live proxy's accounts out on
+// its next restart. Redirect to a throwaway temp dir BEFORE .env is read
+// (loadEnv only fills UNSET keys, so pre-setting DATA_DIR wins) and clear
+// REPLICA_ISOLATE so the temp dir is used directly. `NODE_TEST_CONTEXT` is set
+// by node's built-in test runner.
+if (process.env.NODE_TEST_CONTEXT) {
+  process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'wfapi-test-data-'));
+  delete process.env.REPLICA_ISOLATE;
+}
 
 // Load .env file manually (zero dependencies)
 function loadEnv() {
