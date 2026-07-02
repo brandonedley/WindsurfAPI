@@ -143,6 +143,65 @@ describe('English Layer 3 still works (regression guard)', () => {
   });
 });
 
+describe('GLM user-command fallback safety', () => {
+  const TERMINAL = fnTool('terminal');
+
+  it('does not recover terminal commands from GLM narrate-only user prompts', () => {
+    const r = extractIntentFromNarrative(
+      'The user wants me to run a terminal command and return the exact output.',
+      [TERMINAL], { lastUserText: 'Use the terminal tool to run: printf GLM_TOOL_OK. Return the exact output.' },
+    );
+    assert.equal(r.length, 0);
+  });
+
+  it('does not recover a command when the narrative is a refusal', () => {
+    const r = extractIntentFromNarrative(
+      'I cannot execute that command because it is unsafe.',
+      [TERMINAL], { lastUserText: 'Use the terminal tool to run: rm -rf /tmp/nope. Return the exact output.' },
+    );
+    assert.equal(r.length, 0);
+  });
+
+  it('does not parse quoted shell arguments from user prompt fallback', () => {
+    const r = extractIntentFromNarrative(
+      'The user wants me to run a terminal command and return the exact output.',
+      [TERMINAL], { lastUserText: 'Use the terminal tool to run: printf "Please Return the items". Return the exact output.' },
+    );
+    assert.equal(r.length, 0);
+  });
+
+  it('does not recover explicit read_file paths from GLM narrate-only user prompts', () => {
+    const READ_FILE = fnTool('read_file', { path: 'string' }, ['path']);
+    const r = extractIntentFromNarrative(
+      'The user wants me to read a file and return its content.',
+      [READ_FILE], { lastUserText: 'Use the read_file tool to read /tmp/glm-hermes-read-test.txt. Return only the file content.' },
+    );
+    assert.equal(r.length, 0);
+  });
+
+  it('does not repeat user-prompt fallback after a tool result already exists', () => {
+    const READ_FILE = fnTool('read_file', { path: 'string' }, ['path']);
+    const r = extractIntentFromNarrative(
+      'The user wants me to read a file and return its content.',
+      [READ_FILE], {
+        lastUserText: 'Use the read_file tool to read /tmp/glm-hermes-read-test.txt. Return only the file content.',
+        hasToolResult: true,
+      },
+    );
+    assert.equal(r.length, 0);
+  });
+
+  it('does not fabricate stateful tools like memory from huge user prompts', () => {
+    const MEMORY = fnTool('memory', { action: 'string', target: 'string', content: 'string' }, ['action', 'target']);
+    const hugePrompt = `${'x'.repeat(1000)}\nI'll start by running the Step 0 stale-clone self-check as required by the skill, and also check the engine help to understand available flags.`;
+    const r = extractIntentFromNarrative(
+      'I will use memory to save the result.',
+      [MEMORY], { lastUserText: hugePrompt },
+    );
+    assert.equal(r.length, 0);
+  });
+});
+
 describe('detectToolIntentInNarrative — gates the v2.0.82 retry loop', () => {
   it('detects #125 GLM-5.1 reproducer "让我用 Bash 来列出..."', () => {
     const r = detectToolIntentInNarrative(
@@ -168,14 +227,22 @@ describe('detectToolIntentInNarrative — gates the v2.0.82 retry loop', () => {
     assert.equal(r, null);
   });
 
-  it('falls back to first tool when narrative has action verb but no explicit name (#125 GLM-5.1)', () => {
-    // GLM-5.1 actually emitted "Let me list the files in the workspace."
-    // without saying "Bash" — Pass 2 detection still triggers retry.
+  it('nominates first declared tool when narrative has action verb but no explicit tool name', () => {
+    const MEMORY = fnTool('memory', { action: 'string', target: 'string', content: 'string' }, ['action', 'target']);
     const r = detectToolIntentInNarrative(
       "Let me list the files in the workspace.",
-      [BASH], { lastUserText: '看看本地有哪些文件' },
+      [MEMORY, BASH], { lastUserText: '看看本地有哪些文件' },
     );
-    assert.equal(r, 'Bash');
+    assert.equal(r, 'memory');
+  });
+
+  it('detects explicit tool name in narrative for correction retries', () => {
+    const MEMORY = fnTool('memory', { action: 'string', target: 'string', content: 'string' }, ['action', 'target']);
+    const r = detectToolIntentInNarrative(
+      "I'll use memory to save the stale clone result.",
+      [MEMORY], { lastUserText: 'Run the stale-clone self-check and inspect the repo.' },
+    );
+    assert.equal(r, 'memory');
   });
 
   it('returns null when user prompt is not actionable', () => {

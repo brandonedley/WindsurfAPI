@@ -295,6 +295,9 @@ function userPromptLooksActionable(lastUserText) {
   if (/\b(?:shell|bash|terminal|command|tool|function|file|path)\b/i.test(lastUserText)) return true;
   if (/(?:运行|执行|读取|查看|列出|查找|搜索|获取|修改|编辑|写入|修复|分析|调用|使用|拉取|下载|找到|看一下|看看|检查)/.test(lastUserText)) return true;
   if (/(?:文件|目录|路径|命令|工具|函数|参数|项目|代码|配置)/.test(lastUserText)) return true;
+  // Non-trivial conversational prompts ("continue working", "what's next")
+  // are actionable when the model's narrative shows clear tool intent.
+  if (lastUserText.trim().length >= 10) return true;
   return false;
 }
 
@@ -332,17 +335,31 @@ export function detectToolIntentInNarrative(text, tools, opts = {}) {
   if (!verbPattern.test(text)) return null;
   // Action keywords (file ops, search, read, etc.) — these stand in
   // for "the model is talking about USING tools generically".
-  const actionVerbPattern = /\b(?:list|show|read|cat|grep|find|search|view|fetch|get|create|write|edit|run|execute|check|inspect|examine|analyz|browse|explore)\b|(?:列出|展示|读取|查看|查找|搜索|获取|拉取|下载|创建|写入|编辑|运行|执行|检查|检视|分析|浏览|探索|看一下|看看)/i;
+  const actionVerbPattern = /\b(?:list|show|read|cat|grep|find|search|view|fetch|get|create|write|edit|run|execute|check|inspect|examine|analyz|browse|explore|look)\b|(?:列出|展示|读取|查看|查找|搜索|获取|拉取|下载|创建|写入|编辑|运行|执行|检查|检视|分析|浏览|探索|看一下|看看)/i;
   // Pass 1: specific tool name in narrative (most precise).
   for (const fn of names) {
     const fnRe = new RegExp(`\\b${escapeRe(fn)}\\b|\\\`${escapeRe(fn)}\\\``);
     if (fnRe.test(text)) return fn;
   }
   // Pass 2: action keyword present (model said "let me list..." but
-  // didn't name the tool). Return the first declared tool — caller's
-  // correction prompt will name it explicitly so the retry knows
-  // which tool to emit.
-  if (actionVerbPattern.test(text)) return [...names][0];
+  // didn't name the tool). Prefer exploration tools (read_file,
+  // search_files) for look/explore/inspect verbs; fall back to first
+  // declared tool for other action verbs.
+  if (actionVerbPattern.test(text)) {
+    const exploreVerbs = /\b(?:look|explore|inspect|examine|check|browse|view|search|find|list|show|read)\b|(?:看一下|看看|查看|检查|检视|浏览|探索|查找|搜索|列出|展示|读取)/i;
+    if (exploreVerbs.test(text)) {
+      for (const fn of names) {
+        if (/^(?:read_file|search_files)$/i.test(fn)) return fn;
+      }
+    }
+    const execVerbs = /\b(?:run|execute|exec)\b|(?:运行|执行)/i;
+    if (execVerbs.test(text)) {
+      for (const fn of names) {
+        if (/^(?:terminal|bash|shell_exec)$/i.test(fn)) return fn;
+      }
+    }
+    return [...names][0];
+  }
   return null;
 }
 
