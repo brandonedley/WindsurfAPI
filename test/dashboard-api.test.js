@@ -178,8 +178,8 @@ describe('dashboard batch import proxy binding', () => {
 });
 
 describe('GET /quota-windows (quota governor)', () => {
-  it('returns the per-account+model window summary', async () => {
-    const { recordUpstreamSend, _resetForTests } = await import('../src/quota-window.js');
+  it('returns the per-account window summary with a per-model breakdown', async () => {
+    const { recordUpstreamSend, ACCOUNT_CAP_DEFAULT, _resetForTests } = await import('../src/quota-window.js');
     _resetForTests();
     _resetRuntimeConfigForTests();
     config.dashboardPassword = '';
@@ -187,7 +187,7 @@ describe('GET /quota-windows (quota governor)', () => {
     configureBindHost('127.0.0.1');
 
     recordUpstreamSend('acct-quota-test', 'glm-5.2');
-    recordUpstreamSend('acct-quota-test', 'glm-5.2');
+    recordUpstreamSend('acct-quota-test', 'kimi-k2-6');
 
     const res = fakeRes();
     await handleDashboardApi('GET', '/quota-windows', {}, { headers: {} }, res);
@@ -195,10 +195,12 @@ describe('GET /quota-windows (quota governor)', () => {
     assert.equal(res.statusCode, 200);
     const rows = res.json();
     assert.ok(Array.isArray(rows));
-    const row = rows.find(r => r.modelKey === 'glm-5.2');
-    assert.ok(row, 'glm-5.2 window present');
-    assert.equal(row.count, 2);
-    assert.equal(row.capEstimate, null, 'no cap learned yet');
+    const row = rows.find(r => r.accountId === 'acct-quo'); // 8-char prefix
+    assert.ok(row, 'account window present');
+    assert.equal(row.count, 2, 'account-wide count across both models');
+    assert.deepEqual(row.byModel, { 'glm-5.2': 1, 'kimi-k2-6': 1 });
+    assert.equal(row.capEstimate, ACCOUNT_CAP_DEFAULT, 'default cap until one is learned');
+    assert.equal(row.capSource, 'default');
     assert.equal(row.live, true);
     assert.ok(row.windowEndsInMs > 0);
   });
