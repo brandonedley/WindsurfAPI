@@ -32,14 +32,25 @@ beforeEach(() => {
   delete process.env.WINDSURFAPI_QUOTA_GOVERNOR;
   delete process.env.WINDSURFAPI_QUOTA_SOFT_PCT;
   delete process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP;
+  delete process.env.WINDSURFAPI_QUOTA_WINDOW_HOURS;
 });
 
 const acctWindow = () => getQuotaWindowSummary().find(w => w.accountId === ACCT.slice(0, 8));
 
 // ─── window length ──────────────────────────────────────────────
 
-test('the counting window is one hour (the measured lockout period)', () => {
-  assert.equal(QUOTA_WINDOW_MS, 60 * 60 * 1000);
+// Multi-day log reconciliation (37 lockout episodes; 36/37 fresh marks were
+// "Resets in: 3h0m0s"; a 71-min countdown converged on one unlock instant
+// within 18s) established a fixed ~3-HOUR account window. The earlier "1h"
+// reading was the tail of a single lock mistaken for its onset.
+test('the counting window defaults to three hours (the measured lockout period)', () => {
+  assert.equal(QUOTA_WINDOW_MS, 3 * 60 * 60 * 1000);
+});
+
+test('WINDSURFAPI_QUOTA_WINDOW_HOURS overrides the window length', () => {
+  process.env.WINDSURFAPI_QUOTA_WINDOW_HOURS = '2';
+  recordUpstreamSend(ACCT, GLM, T0);
+  assert.equal(acctWindow().windowEndsAt, T0 + 2 * 60 * 60 * 1000, 'window ends 2h out per override');
 });
 
 // ─── account-wide counting (across models) ──────────────────────
@@ -53,12 +64,12 @@ test('sends across DIFFERENT models count into one shared account window', () =>
   assert.deepEqual(w.byModel, { [GLM]: 2, [KIMI]: 1 }, 'per-model breakdown preserved for display');
 });
 
-test('the window rolls after one hour', () => {
+test('the window rolls after the window length elapses', () => {
   recordUpstreamSend(ACCT, GLM, T0);
   recordUpstreamSend(ACCT, GLM, T0 + 1000);
   assert.equal(acctWindow().count, 2);
   recordUpstreamSend(ACCT, GLM, T0 + QUOTA_WINDOW_MS + 1000);
-  assert.equal(acctWindow().count, 1, 'past 1h a fresh window starts');
+  assert.equal(acctWindow().count, 1, 'past the window a fresh one starts');
 });
 
 test('separate accounts get separate windows', () => {

@@ -3,23 +3,28 @@
  * limit.
  *
  * Reconciling the proxy logs against the Hermes gateway's timestamped session
- * logs settled the shape of this limiter (2026-07-03):
+ * logs, then a multi-day sweep of ~/.windsurf/logs/app-*.jsonl, settled the
+ * shape of this limiter (2026-07-03):
  *
- *   - It is ACCOUNT-level, not per-model. Every model's lockout — glm-5.2 and
- *     kimi-k2-6 alike — counted down to the SAME unlock instant (09:28:37),
- *     across seven separate events. One shared budget for the whole account.
- *   - The window is ~1 HOUR, not 3. The account hit its cap at 08:28:37 and
- *     unlocked exactly 3600s later; the server's own trailer said "Resets in:
- *     51m24s" at 08:37. (The "Resets in: 3h0m0s" trailers are a looser,
- *     usually non-binding per-model counter.)
+ *   - It is ACCOUNT-level, not per-model. In every episode all models — glm-5.2,
+ *     kimi-k2-6, gpt-5.5, claude — counted down to the SAME unlock instant. One
+ *     shared budget for the whole account.
+ *   - The window is a fixed ~3 HOURS. Across 37 lockout episodes, 36 fresh marks
+ *     were "Resets in: 3h0m0s"; in one episode 54 responses over 71 min all
+ *     converged on a single unlock instant within an 18s spread — the server
+ *     owns a fixed 3h reset clock and decrements it. Shorter observed values
+ *     ("51m", "27m") are countdown TAILS, not separate short penalties. (An
+ *     earlier "~1h" read was the tail of one lock mistaken for its onset.)
  *   - Hammering during a lockout does NOT extend it — the unlock instant is
  *     fixed at onset, so retries are benign.
  *
- * The server never reports this limit via any status API (getUserStatus covers
- * only the daily/weekly CREDIT quota, handled separately in auth.js), so the
- * only way to respect it is to count our own upstream sends per ACCOUNT (across
- * all models) and refuse locally — clean 429 + Retry-After, which agent clients
- * follow into their fallback provider — BEFORE the hard 1h lockout.
+ * The server never reports the cap via any status API — confirmed exhaustively:
+ * CheckUserMessageRateLimit.maxMessages returns -1, GetUserStatus JSON carries
+ * only daily/weekly CREDIT-quota percentages, and the LS-native GetUserStatus
+ * field 35 max_num_premium_chat_messages returns 0 for this tier. So the only
+ * way to respect it is to count our own upstream sends per ACCOUNT (across all
+ * models) and refuse locally — clean 429 + Retry-After, which agent clients
+ * follow into their fallback provider — BEFORE the hard 3h lockout.
  *
  * The previous per-(account,model) design learned a garbage cap for kimi-k2-6
  * (22, the count kimi happened to have when an ACCOUNT-level lock landed) and
@@ -49,10 +54,20 @@ import { config, log } from './config.js';
 
 const QUOTA_FILE = join(config.dataDir, 'quota-windows.json');
 
-/** Fixed window length the upstream limiter uses — measured at ~1h (the
- * account locked and unlocked exactly 3600s later; trailer "Resets in 51m24s").
- */
-export const QUOTA_WINDOW_MS = 60 * 60 * 1000;
+/** Default window length the upstream limiter uses — measured at ~3h across 37
+ * lockout episodes (36/37 fresh marks were "Resets in: 3h0m0s"; in one episode
+ * 54 responses over 71 min converged on a single unlock instant within 18s, so
+ * the server owns a fixed 3h reset clock). An earlier "~1h" reading was the
+ * tail of one lock mistaken for its onset. Override with
+ * WINDSURFAPI_QUOTA_WINDOW_HOURS while the exact value is still being pinned. */
+export const QUOTA_WINDOW_MS = 3 * 60 * 60 * 1000;
+
+/** Effective window length, honouring the WINDSURFAPI_QUOTA_WINDOW_HOURS
+ * override so we can retune without a recompile. */
+function windowMs(env = process.env) {
+  const h = parseFloat(env.WINDSURFAPI_QUOTA_WINDOW_HOURS || '');
+  return Number.isFinite(h) && h > 0 ? Math.round(h * 60 * 60 * 1000) : QUOTA_WINDOW_MS;
+}
 
 /** Cap assumed before any lockout has been observed for an account. The
  * account locked around ~100 proxy-visible account-wide sends in the wild. */
@@ -112,7 +127,7 @@ function freshWindow(accountId, now) {
   return {
     accountId: acctPrefix(accountId),
     windowStart: now,
-    windowEnd: now + QUOTA_WINDOW_MS,
+    windowEnd: now + windowMs(),
     count: 0,
     byModel: Object.create(null),
     learnedCaps: [],
@@ -176,7 +191,7 @@ export function onRateLimitLockout(accountId, modelKey, retryAfterMs, now = Date
   w.lockouts++;
   if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
     w.windowEnd = now + retryAfterMs;
-    w.windowStart = Math.min(w.windowStart, w.windowEnd - QUOTA_WINDOW_MS);
+    w.windowStart = Math.min(w.windowStart, w.windowEnd - windowMs());
   }
   if (w.count >= MIN_LEARN_COUNT) {
     w.learnedCaps.push(w.count);
