@@ -20,34 +20,13 @@ import { renameSyncWithRetry } from './fs-atomic.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels, getModelKeysByEnum, MODELS, registerDiscoveredFreeModel } from './models.js';
 import { getLsAdmissionStatus, getLsMaintenanceRequests } from './langserver.js';
+import { bumpConnect } from './devin-connect-metrics.js';
 
 import { join } from 'path';
 // accounts.json lives in the cluster-shared dir so add-account writes from
 // one replica survive future restarts and are visible to every replica.
 // See `src/config.js` (sharedDataDir vs dataDir) and issue #67.
 const ACCOUNTS_FILE = join(config.sharedDataDir || config.dataDir, 'accounts.json');
-// Self-heal backup. accounts.json has been observed getting emptied to `[]`
-// out-of-band (NOT via removeAccount — its "Account removed" log never fired —
-// so the in-memory pool was never cleared by us; the file is truncated by
-// something outside the normal save path). We mirror every NON-EMPTY save to a
-// sibling `.bak` and recover from it on startup when accounts.json loads empty,
-// so a wipe survives a restart instead of silently logging out the pool.
-const ACCOUNTS_BAK = `${ACCOUNTS_FILE}.bak`;
-
-// Mirror a known-good (non-empty) account snapshot to ACCOUNTS_BAK. Best-effort:
-// a backup failure must never block or fail the primary save. We deliberately
-// only mirror NON-EMPTY states — an empty accounts.json is either a legitimate
-// "removed the last account" (removeAccount clears the bak explicitly for that
-// case) or the out-of-band wipe we are guarding against, and in the latter case
-// keeping the last non-empty backup is what makes recovery possible.
-function _mirrorAccountsBak(serialized) {
-  if (!Array.isArray(serialized) || serialized.length === 0) return;
-  try {
-    const tmp = `${ACCOUNTS_BAK}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify(serialized, null, 2));
-    renameSyncWithRetry(tmp, ACCOUNTS_BAK);
-  } catch { /* best-effort */ }
-}
 
 // ─── Account pool ──────────────────────────────────────────
 
@@ -238,11 +217,23 @@ export function getDroughtSummary() {
   };
 }
 
-// ─── Rolling health window (ported verbatim from upstream auth.js) ─────
-// Phase 1 of the upstream merge ports only the ACCESSORS (dashboard/api.js
-// imports getPoolHealthWindow at module load). The recordHealthEvent call
-// sites live in upstream's rewritten pool functions — they arrive in Phase 2,
-// so summaries report zero counts until then.
+function pruneRpmHistory(account, now) {
+  if (!account._rpmHistory) account._rpmHistory = [];
+  const cutoff = now - RPM_WINDOW_MS;
+  while (account._rpmHistory.length && account._rpmHistory[0] < cutoff) {
+    account._rpmHistory.shift();
+  }
+  return account._rpmHistory.length;
+}
+
+// ─── C5: per-account rolling health window (persisted) ──────────────────────
+// RPM history answers "is this account busy right now"; errorCount answers "is
+// it disabled". Neither answers "how has this account BEHAVED over the last
+// hour" — e.g. "currently active but threw 9 throttles in 40min", which is the
+// signal for both smarter selection and incident triage. We keep a compact
+// rolling window of outcome events per account. KEY DIFFERENCE from a pure
+// in-memory counter (copilot2api): this is PERSISTED in accounts.json, so the
+// picture survives a restart instead of resetting to all-healthy.
 const HEALTH_WINDOW_MS = 60 * 60 * 1000;   // 1h rolling window
 const HEALTH_MAX_EVENTS = 240;             // hard cap so a hot account can't bloat the file
 // Event kinds kept short to minimize persisted size: o=ok e=error t=throttle c=capacity d=dead-token
@@ -279,6 +270,31 @@ function healthSummary(account, now = Date.now()) {
   return out;
 }
 
+// C2×C5: feed the rolling health window into SELECTION. An account that's
+// currently throwing a burst of dead-tokens / errors / throttles should be
+// softly de-prioritized for a short window — even while it's still 'active'
+// with RPM headroom — instead of being hammered until it hard-fails (the
+// copilot2api "smart" soft-cooldown idea, but driven by our persisted window).
+// Failures decay naturally: only the last few minutes count, so a recovered
+// account climbs back to full preference on its own. dead/error weigh heavier
+// than throttle/capacity (the latter are often transient upstream load, not an
+// account fault).
+const RECENT_TROUBLE_WINDOW_MS = 5 * 60 * 1000;
+function recentTroubleScore(account, now = Date.now()) {
+  const win = account?._health;
+  if (!Array.isArray(win) || win.length === 0) return 0;
+  const cutoff = now - RECENT_TROUBLE_WINDOW_MS;
+  let score = 0;
+  // Walk from the newest end; events are time-ordered so we can stop early.
+  for (let i = win.length - 1; i >= 0; i--) {
+    const ev = win[i];
+    if (ev.t < cutoff) break;
+    if (ev.k === 'd' || ev.k === 'e') score += 3;
+    else if (ev.k === 't' || ev.k === 'c') score += 1;
+  }
+  return score;
+}
+
 /** Public accessor: rolling-hour health for one account by apiKey. */
 export function getAccountHealth(apiKey, now = Date.now()) {
   const account = accounts.find(a => a.apiKey === apiKey);
@@ -296,13 +312,14 @@ export function getPoolHealthWindow(now = Date.now()) {
   }));
 }
 
-function pruneRpmHistory(account, now) {
-  if (!account._rpmHistory) account._rpmHistory = [];
-  const cutoff = now - RPM_WINDOW_MS;
-  while (account._rpmHistory.length && account._rpmHistory[0] < cutoff) {
-    account._rpmHistory.shift();
-  }
-  return account._rpmHistory.length;
+/** Test seam: short-window trouble score used by selection de-prioritization. */
+export function __recentTroubleScore(account, now = Date.now()) {
+  return recentTroubleScore(account, now);
+}
+
+/** Test seam: is this account currently filtered out of selection for a model? */
+export function __isRateLimitedForModel(account, modelKey = null, now = Date.now()) {
+  return isRateLimitedForModel(account, modelKey, now);
 }
 
 // Serialize concurrent saveAccounts calls — multiple async paths
@@ -315,6 +332,12 @@ function _serializeAccounts() {
     id: a.id, email: a.email, apiKey: a.apiKey,
     apiServerUrl: a.apiServerUrl, method: a.method,
     status: a.status, addedAt: a.addedAt,
+    // AP-RISK-1: half-open recovery clock. Without persisting this an account
+    // flipped to 'error' loses its since-timestamp on restart, so
+    // maybeRecoverErrorAccount computes since=0 and bails forever — the pool
+    // then shrinks monotonically across restarts. _errorAt is deliberately NOT
+    // persisted: it's a transient streak-window field (reset on relogin/success).
+    erroredAt: a.erroredAt || 0,
     tier: a.tier, tierManual: !!a.tierManual,
     capabilities: a.capabilities, lastProbed: a.lastProbed,
     credits: a.credits || null,
@@ -323,6 +346,17 @@ function _serializeAccounts() {
     // From GetUserStatus — the authoritative tier/entitlement snapshot.
     userStatus: a.userStatus || null,
     userStatusLastFetched: a.userStatusLastFetched || 0,
+    // RB2/B2: quota-exhaustion cooldown deadline (own self-healing dimension,
+    // separate from transient rateLimitedUntil). Persisted so a restart mid-
+    // cooldown doesn't immediately re-select a dry account and eat a 402.
+    quotaResetAt: a.quotaResetAt || 0,
+    // RB2/B1: exponential-backoff episode streak. Persisted as "memory" (not a
+    // disable state) so a restart doesn't reset a repeat-offender's ladder to
+    // zero; losing it is harmless (backoff just restarts) so it's best-effort.
+    _breakerStreak: a._breakerStreak || 0,
+    // C5: persisted rolling-hour health window (pruned at save time so the
+    // file never carries stale/out-of-window events across restarts).
+    _health: Array.isArray(a._health) ? pruneHealthWindow(a, Date.now()) : [],
   }));
 }
 
@@ -335,10 +369,8 @@ function saveAccounts() {
     // mid-write cannot leave accounts.json truncated/corrupt. The unique
     // tmp also prevents concurrent test/process saves from racing on the
     // same `${ACCOUNTS_FILE}.tmp` name.
-    const snapshot = _serializeAccounts();
-    writeFileSync(tempFile, JSON.stringify(snapshot, null, 2));
+    writeFileSync(tempFile, JSON.stringify(_serializeAccounts(), null, 2));
     renameSyncWithRetry(tempFile, ACCOUNTS_FILE);
-    _mirrorAccountsBak(snapshot);
   } catch (e) {
     log.error('Failed to save accounts:', e.message);
     try { unlinkSync(tempFile); } catch {}
@@ -358,10 +390,8 @@ function saveAccounts() {
 export function saveAccountsSync() {
   const tempFile = `${ACCOUNTS_FILE}.${process.pid}.shutdown.tmp`;
   try {
-    const snapshot = _serializeAccounts();
-    writeFileSync(tempFile, JSON.stringify(snapshot, null, 2));
+    writeFileSync(tempFile, JSON.stringify(_serializeAccounts(), null, 2));
     renameSyncWithRetry(tempFile, ACCOUNTS_FILE);
-    _mirrorAccountsBak(snapshot);
   } catch (e) {
     log.error('Shutdown: failed to flush accounts:', e.message);
     try { unlinkSync(tempFile); } catch {}
@@ -415,27 +445,43 @@ export function migrateReplicaAccountsTo({ sharedDir, accountsFile, logger = log
   }
 }
 
-// Pure, testable: decide which account data to load. Reads `accountsFile`,
-// tolerating missing/corrupt/empty; if it yields no accounts but `bakFile` holds
-// a non-empty snapshot, recover from the backup (the out-of-band wipe guard).
-// Returns { data: array|null, recovered: boolean }.
-export function recoverAccountsData({ accountsFile, bakFile, logger = log }) {
-  let data = null;
-  if (accountsFile && existsSync(accountsFile)) {
-    try { data = JSON.parse(readFileSync(accountsFile, 'utf-8')); } catch { data = null; }
-  }
-  let recovered = false;
-  if ((!Array.isArray(data) || data.length === 0) && bakFile && existsSync(bakFile)) {
-    try {
-      const bak = JSON.parse(readFileSync(bakFile, 'utf-8'));
-      if (Array.isArray(bak) && bak.length > 0) {
-        logger.warn?.(`accounts.json was empty/missing but ${bak.length} account(s) found in ${bakFile} — RECOVERING. Something emptied accounts.json out-of-band (not removeAccount); investigate the writer.`);
-        data = bak;
-        recovered = true;
-      }
-    } catch { /* corrupt backup — fall through */ }
-  }
-  return { data: Array.isArray(data) ? data : null, recovered };
+// Rehydrate one persisted account record into a live in-memory account.
+// Pure (aside from `now`, defaulted for testability) so the serialize→load
+// round-trip can be exercised without touching disk or the dedup pass.
+function _deserializeAccount(a, now = Date.now()) {
+  const status = a.status || 'active';
+  // AP-RISK-1: restore the half-open recovery clock. An older accounts.json
+  // (written before erroredAt was persisted) has none, so an account already
+  // in 'error' would recover with since=0 → never. Default it to load time so
+  // it re-probes after the normal cooldown rather than staying disabled forever.
+  const erroredAt = a.erroredAt || (status === 'error' ? now : 0);
+  return {
+    id: a.id || randomUUID().slice(0, 8),
+    email: a.email, apiKey: a.apiKey,
+    apiServerUrl: a.apiServerUrl || '',
+    method: a.method || 'api_key',
+    status,
+    lastUsed: 0, errorCount: 0,
+    refreshToken: a.refreshToken || '', expiresAt: 0, refreshTimer: null,
+    addedAt: a.addedAt || now,
+    erroredAt,
+    tier: a.tier || 'unknown',
+    capabilities: a.capabilities || {},
+    lastProbed: a.lastProbed || 0,
+    credits: a.credits || null,
+    blockedModels: Array.isArray(a.blockedModels) ? a.blockedModels : [],
+    tierManual: !!a.tierManual,
+    userStatus: a.userStatus || null,
+    userStatusLastFetched: a.userStatusLastFetched || 0,
+    // RB2/B2 + B1: restore self-healing quota cooldown + backoff memory.
+    quotaResetAt: a.quotaResetAt || 0,
+    _breakerStreak: a._breakerStreak || 0,
+    // C5: restore the rolling health window; drop anything already out of
+    // the 1h window at load so a long-stopped process starts clean.
+    _health: Array.isArray(a._health)
+      ? a._health.filter(e => e && typeof e.t === 'number' && now - e.t < HEALTH_WINDOW_MS && HEALTH_KINDS.has(e.k))
+      : [],
+  };
 }
 
 function loadAccounts() {
@@ -444,45 +490,42 @@ function loadAccounts() {
       sharedDir: config.sharedDataDir || config.dataDir,
       accountsFile: ACCOUNTS_FILE,
     });
-    const { data, recovered } = recoverAccountsData({ accountsFile: ACCOUNTS_FILE, bakFile: ACCOUNTS_BAK });
-    if (!data) return;
+    if (!existsSync(ACCOUNTS_FILE)) return;
+    const data = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf-8'));
     for (const a of data) {
       if (accounts.find(x => x.apiKey === a.apiKey)) continue;
-      accounts.push({
-        id: a.id || randomUUID().slice(0, 8),
-        email: a.email, apiKey: a.apiKey,
-        apiServerUrl: a.apiServerUrl || '',
-        method: a.method || 'api_key',
-        status: a.status || 'active',
-        lastUsed: 0, errorCount: 0,
-        refreshToken: a.refreshToken || '', expiresAt: 0, refreshTimer: null,
-        addedAt: a.addedAt || Date.now(),
-        tier: a.tier || 'unknown',
-        capabilities: a.capabilities || {},
-        lastProbed: a.lastProbed || 0,
-        credits: a.credits || null,
-        blockedModels: Array.isArray(a.blockedModels) ? a.blockedModels : [],
-        tierManual: !!a.tierManual,
-        userStatus: a.userStatus || null,
-        userStatusLastFetched: a.userStatusLastFetched || 0,
-      });
+      accounts.push(_deserializeAccount(a));
     }
-    if (data.length > 0) log.info(`Loaded ${data.length} account(s) from disk${recovered ? ' (recovered from backup)' : ''}`);
-    // Rewrite accounts.json from the recovered state so the file is whole again.
-    if (recovered) saveAccounts();
+    if (data.length > 0) log.info(`Loaded ${data.length} account(s) from disk`);
   } catch (e) {
     log.error('Failed to load accounts:', e.message);
   }
 }
 
+// Test seams: exercise the serialize→load round-trip without disk/dedup.
+export function __serializeAccounts() { return _serializeAccounts(); }
+export function __deserializeAccount(a, now = Date.now()) { return _deserializeAccount(a, now); }
+export function __maybeRecoverErrorAccount(account, now = Date.now()) {
+  return maybeRecoverErrorAccount(account, now);
+}
+
 // ─── Dynamic model catalog from cloud ─────────────────────
+
+// Tracks whether the cloud model catalog has been successfully merged at
+// least once since startup. When false, trySyncModelCatalog() will fire
+// off a fetch whenever an account becomes active — covering the case where
+// the startup fetch was skipped because no active account existed yet.
+let _modelCatalogSynced = false;
+// Coalesces concurrent calls so multiple simultaneous status transitions
+// (e.g. bulk-add accounts) only trigger one fetch.
+let _modelCatalogSyncPromise = null;
 
 async function fetchAndMergeModelCatalog() {
   // Use the first active account to fetch the catalog.
   const acct = accounts.find(a => a.status === 'active' && a.apiKey);
   if (!acct) {
     log.debug('No active account for model catalog fetch');
-    return;
+    return false;
   }
   try {
     const { getCascadeModelConfigs } = await import('./windsurf-api.js');
@@ -490,10 +533,28 @@ async function fetchAndMergeModelCatalog() {
     const proxy = getEffectiveProxy(acct.id) || null;
     const { configs } = await getCascadeModelConfigs(acct.apiKey, proxy);
     const added = mergeCloudModels(configs);
+    _modelCatalogSynced = true;
     log.info(`Model catalog: ${configs.length} cloud models, ${added} new entries merged`);
+    return true;
   } catch (e) {
     log.warn(`Model catalog fetch failed: ${e.message}`);
+    return false;
   }
+}
+
+/**
+ * Fire-and-forget: trigger a cloud model catalog sync if one hasn't succeeded
+ * yet and at least one active account exists. Safe to call from any account
+ * status transition path — coalesces concurrent calls into a single fetch.
+ */
+export function trySyncModelCatalog() {
+  if (_modelCatalogSynced) return;
+  if (_modelCatalogSyncPromise) return;
+  const acct = accounts.find(a => a.status === 'active' && a.apiKey);
+  if (!acct) return;
+  _modelCatalogSyncPromise = fetchAndMergeModelCatalog()
+    .catch(e => log.warn(`trySyncModelCatalog: ${e.message}`))
+    .finally(() => { _modelCatalogSyncPromise = null; });
 }
 
 async function registerWithCodeium(idToken) {
@@ -537,9 +598,11 @@ export function addAccountByKey(apiKey, label = '', apiServerUrl = '') {
     blockedModels: [],
   };
   account.credits = null;
+  seedNewAccountBaseline(account); // RB2/T3a: avoid a batch all-first-picked
   accounts.push(account);
   saveAccounts();
   log.info(`Account added: ${safeAccountRef(account)} [api_key]`);
+  trySyncModelCatalog();
   return account;
 }
 
@@ -570,9 +633,11 @@ export async function addAccountByToken(token, label = '') {
     blockedModels: [],
     credits: null,
   };
+  seedNewAccountBaseline(account); // RB2/T3a
   accounts.push(account);
   saveAccounts();
   log.info(`Account added: ${safeAccountRef(account)} [token] server=${account.apiServerUrl}`);
+  trySyncModelCatalog();
   return account;
 }
 
@@ -616,8 +681,18 @@ export async function addAccountByEmail(email, password) {
       idToken: result.idToken || '',
     });
   }
+  // Persist the password (encrypted) so a dead session_id can be auto-recovered
+  // via re-login. No-op unless DEVIN_CONNECT_CRED_KEY is set. Best-effort: a
+  // store failure must not break the login that already succeeded.
+  try {
+    const { storeCredential, isCredStoreEnabled } = await import('./devin-connect-credentials.js');
+    if (isCredStoreEnabled()) storeCredential(email, password);
+  } catch (e) {
+    log.warn(`could not persist credential for re-login: ${e.message}`);
+  }
   saveAccounts();
   log.info(`Account added via email: ${safeAccountRef(account)}`);
+  trySyncModelCatalog();
   return account;
 }
 
@@ -704,6 +779,7 @@ export function setAccountStatus(id, status) {
   if (status === 'active') account.errorCount = 0;
   saveAccounts();
   log.info(`Account ${id} status set to ${status}`);
+  if (status === 'active') trySyncModelCatalog();
   return true;
 }
 
@@ -717,6 +793,7 @@ export function resetAccountErrors(id) {
   account.status = 'active';
   saveAccounts();
   log.info(`Account ${id} errors reset`);
+  trySyncModelCatalog();
   return true;
 }
 
@@ -764,6 +841,192 @@ export function setAccountTokens(id, { apiKey, refreshToken, idToken } = {}) {
   return true;
 }
 
+// Per-account re-login throttle: a dead session_id will reject EVERY in-flight
+// request at once, so without a cooldown a burst of UNAUTHORIZED would fire a
+// login storm against the upstream. We allow one re-login attempt per account
+// per cooldown window and de-dupe concurrent attempts onto a single promise.
+const RELOGIN_COOLDOWN_MS = 60 * 1000;
+const _reloginState = new Map(); // id → { lastAttempt, inflight }
+
+// C4: global re-login concurrency gate. Per-account inflight coalescing + the
+// 60s cooldown already stop ONE account from re-logging in a storm. But when a
+// whole batch of tokens dies at once (upstream session purge, a network blip,
+// process restart against many stale tokens), each DIFFERENT account would fire
+// a full heavy Auth1 login in parallel — a relogin stampede that can itself
+// trip upstream anti-abuse and bury the box in concurrent logins. This caps the
+// number of *simultaneous* real logins fleet-wide; excess callers queue (FIFO)
+// for a freed slot rather than all hammering the upstream at once.
+const RELOGIN_MAX_CONCURRENT = () => {
+  const n = Number(process.env.DEVIN_CONNECT_RELOGIN_MAX_CONCURRENT);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 2;
+};
+let _reloginActive = 0;
+const _reloginWaiters = [];
+function acquireReloginSlot() {
+  if (_reloginActive < RELOGIN_MAX_CONCURRENT()) {
+    _reloginActive += 1;
+    return Promise.resolve();
+  }
+  return new Promise(resolve => _reloginWaiters.push(resolve));
+}
+function releaseReloginSlot() {
+  const next = _reloginWaiters.shift();
+  if (next) {
+    // Hand the slot directly to the next waiter — active count stays the same.
+    next();
+  } else {
+    _reloginActive = Math.max(0, _reloginActive - 1);
+  }
+}
+
+// Test seam: override the login impl + credential getter so re-login logic can
+// be exercised without real network / a real encrypted store. null → use the
+// real windsurfLogin + devin-connect-credentials.
+let _reloginDeps = null;
+export function __setReloginDeps(deps) { _reloginDeps = deps; }
+
+/** Test seam: clear the re-login throttle between cases. */
+export function __resetReloginState() {
+  _reloginState.clear();
+  _reloginActive = 0;
+  _reloginWaiters.length = 0;
+}
+
+/** Test/observability seam: current global re-login gate state. */
+export function __reloginGateState() {
+  return { active: _reloginActive, waiting: _reloginWaiters.length, max: RELOGIN_MAX_CONCURRENT() };
+}
+
+/**
+ * Recover a dead DEVIN_CONNECT session token by performing a fresh Auth1
+ * email/password login and swapping in the new session token.
+ *
+ * The session token (account.apiKey, `devin-session-token$...`) is an opaque
+ * server-side session_id with no expiry/refresh — once the server retires it,
+ * the ONLY way back is a full re-login. This requires the account's password
+ * to be in the encrypted credential store (DEVIN_CONNECT_CRED_KEY set) and
+ * DEVIN_CONNECT_AUTO_RELOGIN=1. Without either, this is a no-op returning false.
+ *
+ * Throttled + de-duped per account so a burst of UNAUTHORIZED can't trigger a
+ * login storm. Returns the new apiKey on success, false otherwise.
+ *
+ * @param {string} id account id
+ * @param {object} [opts]
+ * @param {boolean} [opts.force] bypass the cooldown (e.g. liveness-probe driven)
+ */
+export async function reLoginAccount(id, { force = false } = {}) {
+  if (String(process.env.DEVIN_CONNECT_AUTO_RELOGIN || '') !== '1') return false;
+  const account = accounts.find(a => a.id === id);
+  if (!account) return false;
+
+  const { isCredStoreEnabled, getCredential } = _reloginDeps
+    || await import('./devin-connect-credentials.js');
+  if (!isCredStoreEnabled()) return false;
+
+  const state = _reloginState.get(id) || { lastAttempt: 0, inflight: null };
+  if (state.inflight) return state.inflight; // coalesce concurrent callers
+  const now = Date.now();
+  if (!force && now - state.lastAttempt < RELOGIN_COOLDOWN_MS) {
+    log.debug(`re-login ${safeAccountRef(account)} skipped: cooldown`);
+    return false;
+  }
+
+  const attempt = (async () => {
+    let password;
+    try {
+      password = getCredential(account.email);
+    } catch (e) {
+      // Wrong key / tampered record — credential unusable, not absent.
+      log.warn(`re-login ${safeAccountRef(account)}: credential unusable (${e.message})`);
+      return false;
+    }
+    if (!password) {
+      log.debug(`re-login ${safeAccountRef(account)} skipped: no stored credential`);
+      return false;
+    }
+    // Hold a global slot only around the heavy Auth1 login network call so a
+    // mass token-death event can't launch an unbounded login stampede.
+    await acquireReloginSlot();
+    try {
+      const proxy = getEffectiveProxy(account.id) || null;
+      const { windsurfLogin } = _reloginDeps || await import('./dashboard/windsurf-login.js');
+      const result = await windsurfLogin(account.email, password, proxy);
+      if (!result?.apiKey) throw new Error('login returned no apiKey');
+      account.apiKey = result.apiKey;
+      if (result.refreshToken) account.refreshToken = result.refreshToken;
+      account.status = 'active';
+      account.errorCount = 0;
+      account._errorAt = 0;
+      account._reloginAt = Date.now();
+      saveAccounts();
+      log.info(`re-login OK: ${safeAccountRef(account)} → fresh session token`);
+      bumpConnect('relogin_ok');
+      return result.apiKey;
+    } catch (e) {
+      log.warn(`re-login ${safeAccountRef(account)} failed: ${e.message}`);
+      bumpConnect('relogin_fail');
+      return false;
+    } finally {
+      releaseReloginSlot();
+    }
+  })();
+
+  state.lastAttempt = now;
+  state.inflight = attempt;
+  _reloginState.set(id, state);
+  try {
+    return await attempt;
+  } finally {
+    const s = _reloginState.get(id);
+    if (s) s.inflight = null;
+  }
+}
+
+/**
+ * Liveness-probe a DEVIN_CONNECT account's session token (zero-billable
+ * GetUserStatus) and recover it pre-emptively if it's dead.
+ *
+ * The point is to catch a retired session_id BEFORE a user request lands on it:
+ * a dead token marks the account 'error' and, if auto-relogin is configured,
+ * triggers a re-login so the next request lands on a fresh token.
+ *
+ * @param {string} id account id
+ * @param {object} [opts]
+ * @param {AbortSignal} [opts.signal]
+ * @returns {Promise<{alive:boolean, recovered?:boolean, code?:string}>}
+ */
+export async function probeAndRecoverConnectAccount(id, { signal } = {}) {
+  const account = accounts.find(a => a.id === id);
+  if (!account) return { alive: false, code: 'NO_ACCOUNT' };
+
+  const { checkSessionLiveness } = (_reloginDeps && _reloginDeps.checkSessionLiveness)
+    ? _reloginDeps
+    : await import('./devin-connect-catalog.js');
+  const result = await checkSessionLiveness({ token: account.apiKey, signal });
+  if (result.alive) {
+    // A previously-errored account that now probes alive is healthy again.
+    if (account.status === 'error') {
+      account.status = 'active';
+      account.errorCount = 0;
+      account._errorAt = 0;
+      saveAccounts();
+      log.info(`liveness probe: ${safeAccountRef(account)} recovered to active`);
+    }
+    return { alive: true };
+  }
+
+  // Only a genuine auth death warrants pre-emptive recovery; a transient
+  // rate-limit or 5xx is not the session_id dying.
+  if (result.code === 'UNAUTHORIZED') {
+    log.warn(`liveness probe: ${safeAccountRef(account)} session token DEAD (${result.code})`);
+    reportError(account.apiKey);
+    const fresh = await reLoginAccount(id, { force: true }).catch(() => false);
+    if (fresh) bumpConnect('liveness_recovered');
+    return { alive: false, recovered: Boolean(fresh), code: result.code };
+  }
+  return { alive: false, code: result.code };
+}
+
 /**
  * Remove an account by ID.
  */
@@ -772,12 +1035,6 @@ export function removeAccount(id) {
   if (idx === -1) return false;
   const account = accounts[idx];
   accounts.splice(idx, 1);
-  // A deliberate removal of the LAST account is the one legitimate way to reach
-  // an empty pool. Drop the self-heal backup so the next restart doesn't
-  // resurrect the just-deleted account from .bak. (Any non-empty save rewrites
-  // the bak, so partial removals stay backed up.)
-  if (accounts.length === 0) { try { unlinkSync(ACCOUNTS_BAK); } catch { /* no bak */ } }
-  log.warn(`removeAccount(${id}) — pool now has ${accounts.length} account(s) [${safeAccountRef(account)}]`);
   saveAccounts();
   // Drop any Cascade conversations owned by this key so future requests
   // don't try to resume on an account that no longer exists.
@@ -873,6 +1130,15 @@ export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null) {
     const ix = accountInflight(x.account) + accountMaintenance(x.account);
     const iy = accountInflight(y.account) + accountMaintenance(y.account);
     if (ix !== iy) return ix - iy;
+    // C2×C5 — soft de-prioritize an account that's wobbling RIGHT NOW (recent
+    // dead-token/error burst) even though it's still 'active' with headroom.
+    // Bucketed so minor noise (a single throttle) doesn't override quota/LRU
+    // fairness; only a real trouble cluster (bucket ≥ 1, i.e. score ≥ 3 ≈ one
+    // hard failure) demotes the account. Decays out of the 5-min window on its
+    // own. Healthy accounts score 0 → no effect on existing ordering.
+    const tx = Math.floor(recentTroubleScore(x.account, now) / 3);
+    const ty = Math.floor(recentTroubleScore(y.account, now) / 3);
+    if (tx !== ty) return tx - ty;
     const qx = quotaScore(x.account);
     const qy = quotaScore(y.account);
     // Bucket the score so we don't churn across small noise (e.g. 41 vs
@@ -985,28 +1251,89 @@ export function releaseAccount(apiKey) {
   if (!apiKey) return;
   const a = accounts.find(x => x.apiKey === apiKey);
   if (!a) return;
+  _releaseAccountObj(a);
+}
+
+// REF-1 (audit P1): release the in-flight slot by the IMMUTABLE account.id
+// instead of the mutable apiKey. A background re-login (reLoginAccount) swaps
+// account.apiKey in place, so a caller holding a pre-relogin snapshot key would
+// miss the account entirely on release (accounts.find(apiKey===oldKey) →
+// undefined) and leak an in-flight slot forever — permanently deprioritising a
+// healthy account in getApiKey's inflight-ascending sort (#165 re-manifest).
+export function releaseAccountById(id) {
+  if (!id) return;
+  const a = accounts.find(x => x.id === id);
+  if (!a) return;
+  _releaseAccountObj(a);
+}
+
+function _releaseAccountObj(a) {
   a._inflight = Math.max(0, (a._inflight || 0) - 1);
+  // R2: keep _inflightAt tracking the NEWEST activity. When a request completes
+  // while others are still in flight, refresh the timestamp so those survivors
+  // aren't judged stale off the oldest acquire. When the account goes fully idle,
+  // clear it so a future leaked slot is measured from ITS acquire, not a stale one.
+  if (a._inflight === 0) a._inflightAt = 0;
+  else a._inflightAt = Date.now();
+}
+
+// REF-1/REF-2: resolve the account's CURRENT (live) apiKey from its immutable
+// id. finalize/health-report call sites hold a snapshot apiKey captured at
+// acquire time; if a re-login re-keyed the account since, that snapshot is
+// stale and every mark*/report* lookup (accounts.find(apiKey===snapshot))
+// silently no-ops. Resolving through the id first keeps cooldown/health
+// reporting landing on the right account; falls back to the snapshot key when
+// the id is unknown (env-token path) so behaviour is unchanged there.
+export function currentApiKeyForId(id, fallback = '') {
+  if (!id) return fallback;
+  const a = accounts.find(x => x.id === id);
+  return a?.apiKey || fallback;
 }
 
 // v2.0.96: safety net — auto-reset stale inflight counters that weren't
 // decremented due to connection drops, crashes, or missed finally blocks.
 // Without this a single leaked inflight permanently deprioritises an
 // account in getApiKey's sort order (fixes #165).
-const INFLIGHT_STALE_MS = 120_000;
+//
+// R2: the threshold MUST exceed the longest legitimate request lifetime, or a
+// normal long stream/ACP session gets its counter wrongly zeroed mid-flight —
+// making a busy account read as idle in getApiKey's sort and oversubscribing it.
+// The absolute upstream deadline is DEVIN_CONNECT_TIMEOUT_MS (default 600s), so a
+// leaked slot can't outlive that by much; we take max(that + 5min margin, 15min)
+// as the floor. `_inflightAt` is also refreshed on release (see releaseAccount) so
+// it tracks the NEWEST activity, not the first acquire — a steady stream of short
+// requests keeps the account "fresh" and only a genuinely abandoned slot ages out.
+const INFLIGHT_STALE_FLOOR_MS = 15 * 60_000;
+function inflightStaleMs() {
+  const deadline = Number(process.env.DEVIN_CONNECT_TIMEOUT_MS) || 600_000;
+  return Math.max(deadline + 5 * 60_000, INFLIGHT_STALE_FLOOR_MS);
+}
 let _inflightCleanupTimer = null;
+// One sweep of the stale-inflight safety net. Extracted from the interval so R2
+// is unit-testable without waiting 60s. Only resets slots older than the
+// deadline-derived threshold — a legitimately long in-flight request is spared.
+function runInflightCleanup(now = Date.now()) {
+  const staleMs = inflightStaleMs();
+  let reset = 0;
+  for (const a of accounts) {
+    if ((a._inflight || 0) > 0 && a._inflightAt && (now - a._inflightAt) > staleMs) {
+      log.warn(`Account ${safeAccountRef(a)} inflight=${a._inflight} stale >${Math.round((now - a._inflightAt) / 1000)}s (>${Math.round(staleMs / 1000)}s cap), auto-resetting`);
+      a._inflight = 0;
+      a._inflightAt = 0;
+      reset++;
+    }
+  }
+  return reset;
+}
 function startInflightCleanup() {
   if (_inflightCleanupTimer) return;
-  _inflightCleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const a of accounts) {
-      if ((a._inflight || 0) > 0 && a._inflightAt && (now - a._inflightAt) > INFLIGHT_STALE_MS) {
-        log.warn(`Account ${safeAccountRef(a)} inflight=${a._inflight} stale >${Math.round((now - a._inflightAt) / 1000)}s, auto-resetting`);
-        a._inflight = 0;
-        a._inflightAt = 0;
-      }
-    }
-  }, 60_000).unref();
+  _inflightCleanupTimer = setInterval(() => runInflightCleanup(), 60_000).unref();
 }
+
+// Test seams: run one cleanup pass deterministically, and read the current
+// deadline-derived stale threshold, without touching the 60s interval.
+export function __runInflightCleanup(now = Date.now()) { return runInflightCleanup(now); }
+export function __inflightStaleMs() { return inflightStaleMs(); }
 
 /**
  * Try to re-check-out a specific account by apiKey, applying the same
@@ -1053,6 +1380,15 @@ export function getAccountAvailability(apiKey, modelKey = null) {
 
   if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
     return { available: false, reason: 'rate_limited', retryAfterMs: Math.max(1000, a.rateLimitedUntil - now) };
+  }
+  // R6: the quota dimension (quotaResetAt) is account-wide and self-healing, kept
+  // separate from the transient rateLimitedUntil. isRateLimitedForModel already
+  // gates selection on it, so the availability VIEW must report it too — otherwise
+  // a quota-dry account (whether cooled by a live 402 or a proactive snapshot)
+  // reads as `available` here while selection quietly skips it (the inconsistency
+  // R6 closes). Reported distinctly from a transient throttle for observability.
+  if (a.quotaResetAt && a.quotaResetAt > now) {
+    return { available: false, reason: 'quota_exhausted', retryAfterMs: Math.max(1000, a.quotaResetAt - now) };
   }
   if (modelKey && a._modelRateLimits) {
     const until = a._modelRateLimits[modelKey];
@@ -1170,9 +1506,10 @@ function residentProbeSkip(account, admission = getLsAdmissionForAccount(account
  * other models remain routable. When omitted, the entire account is blocked
  * (legacy behaviour, used by generic 429 responses).
  */
-export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = null) {
+export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = null, healthKind = 't') {
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
+  recordHealthEvent(account, healthKind);
   const safeMs = Math.max(1000, Number(durationMs) || 0);
   const until = Date.now() + safeMs;
   if (modelKey) {
@@ -1211,6 +1548,159 @@ function errorRecoveryTtlMs() {
   return Number.isFinite(raw) && raw >= 1000 ? raw : 15 * 60 * 1000;
 }
 
+// ─── RB2/B1: account-level exponential backoff knobs ────────────────────────
+// transient-first: this backoff ONLY stretches the SELF-HEALING cooldown of an
+// account that keeps re-entering the 'error' streak. It writes to the existing
+// rateLimitedUntil (expires on its own) and is hard-capped at breakerMaxMs(), so
+// a wobbling account is ALWAYS eligible again after the cap — there is no path
+// from here to a permanent disable. Transients (CAPACITY/UPSTREAM_INTERNAL/
+// RATE_LIMITED) never reach reportError at all (chat.js routes them elsewhere),
+// so they can never be escalated by this ladder.
+function breakerEnabled() {
+  return process.env.WINDSURFAPI_BREAKER !== '0';
+}
+function breakerBaseMs() {
+  // Default base = the half-open recovery TTL, so a FIRST error episode behaves
+  // exactly like today (no extra cooldown is applied at streak 1 — see
+  // reportError). Only repeated episodes escalate beyond this.
+  const raw = Number(process.env.WINDSURFAPI_BREAKER_BASE_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : errorRecoveryTtlMs();
+}
+function breakerFactor() {
+  const raw = Number(process.env.WINDSURFAPI_BREAKER_FACTOR);
+  return Number.isFinite(raw) && raw > 1 ? raw : 1.5;
+}
+function breakerMaxMs() {
+  // Hard ceiling on the backoff. NEVER "permanent" — 60min by default. The
+  // account re-enters the candidate pool the moment this expires.
+  const raw = Number(process.env.WINDSURFAPI_BREAKER_MAX_MS);
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 60 * 60 * 1000;
+}
+
+// ─── RB2/T3: new-credential thunderstorm grace window ───────────────────────
+// A freshly-added account hasn't earned a behavioural track record. While it's
+// within this grace window we (a) seed its LRU position at pool-median instead
+// of "oldest" so a batch isn't all first-picked at once (see addAccount*), and
+// (b) exempt it from the exponential backoff escalation so transient onboarding
+// wobble can't be ramped into long lockouts. Set the window to 0 to disable T3b.
+function newAccountGraceMs() {
+  const raw = Number(process.env.WINDSURFAPI_NEW_ACCOUNT_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 10 * 60 * 1000;
+}
+function isNewAccount(account, now = Date.now()) {
+  const added = account?.addedAt || 0;
+  if (!added) return false;
+  return (now - added) < newAccountGraceMs();
+}
+
+// RB2/T3a: stop a freshly-added account (or a BATCH added together) from being
+// first-picked by every initial request. A new account defaults to lastUsed=0,
+// which the getApiKey LRU tiebreaker reads as "oldest → most preferred"; a batch
+// all at 0 also ties perfectly, collapsing onto sharding-hash dispersion. We
+// seed lastUsed at the pool's MEDIAN (so the newcomer sits at "average
+// freshness", neither first-picked nor discriminated against) plus a small
+// per-account jitter so a batch de-synchronizes instead of tying.
+//
+// Pure ordering change — zero new cooldown/disable, so there is no self-healing
+// concern (worst case is a slightly different pick order). When the pool has no
+// running history (empty / all lastUsed=0, e.g. fresh boot or unit tests) we
+// leave lastUsed=0 untouched so existing behaviour is unchanged. Toggle off via
+// WINDSURFAPI_NEW_ACCOUNT_BASELINE=0.
+function newAccountBaselineEnabled() {
+  return process.env.WINDSURFAPI_NEW_ACCOUNT_BASELINE !== '0';
+}
+function _poolMedianLastUsed() {
+  const vals = accounts
+    .filter(a => a.status === 'active' && (a.lastUsed || 0) > 0)
+    .map(a => a.lastUsed)
+    .sort((x, y) => x - y);
+  if (!vals.length) return 0;
+  const mid = Math.floor(vals.length / 2);
+  return vals.length % 2 ? vals[mid] : Math.round((vals[mid - 1] + vals[mid]) / 2);
+}
+function seedNewAccountBaseline(account) {
+  if (!account || !newAccountBaselineEnabled()) return;
+  const median = _poolMedianLastUsed();
+  if (median <= 0) return; // no running pool to balance against → leave as-is
+  // Small jitter (0..30s) below the median so a batch added at once doesn't all
+  // tie on the same value, while still keeping newcomers near "average freshness".
+  account.lastUsed = Math.max(0, median - Math.floor(Math.random() * 30_000));
+}
+
+// ─── RB2/B2: quota-exhaustion closed-loop knobs ─────────────────────────────
+// transient-first: a quota dry-well is a real account-level condition, but the
+// cooldown lives on its OWN self-healing dimension (account.quotaResetAt) that
+// (a) expires on its own and (b) is cleared the instant a later refresh sees
+// the balance recover. There is NO permanent disable here — Windsurf quota
+// refills on a weekly/daily cycle.
+function quotaCooldownEnabled() {
+  return process.env.WINDSURFAPI_QUOTA_COOLDOWN !== '0';
+}
+function quotaCooldownMs() {
+  const raw = Number(process.env.WINDSURFAPI_QUOTA_COOLDOWN_MS);
+  // Default 30min, matching chat.js's post-402 QUOTA_EXHAUSTED cooldown.
+  return Number.isFinite(raw) && raw >= 1000 ? raw : 30 * 60 * 1000;
+}
+function quotaDryThreshold() {
+  // weeklyPercent at/under this is treated as "dry". Default 0 (only a literal
+  // zero-balance pre-cools), the conservative choice while the paid-account
+  // weeklyPercent wire shape is still unverified (#15/#28/#29).
+  const raw = Number(process.env.WINDSURFAPI_QUOTA_DRY_THRESHOLD);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+}
+
+/**
+ * RB2/B2+B3+B6: react to a freshly-refreshed credits snapshot. Extracted from
+ * refreshCredits so the dry/recover decision is unit-testable without mocking
+ * the GetUserStatus network call. Self-healing both ways: a dry account is
+ * cooled on quotaResetAt (auto-expires); a recovered account is uncooled
+ * immediately. Kept off the transient rateLimitedUntil dimension (B6) so a
+ * quota cooldown and a transient blip never clobber one another.
+ */
+export function applyQuotaSnapshot(account, weeklyPercent, now = Date.now()) {
+  if (!account || !quotaCooldownEnabled()) return;
+  const w = typeof weeklyPercent === 'number' ? weeklyPercent : null;
+  if (w === null) return; // unknown balance → never cool (don't punish unprobed)
+  if (w <= quotaDryThreshold()) {
+    const alreadyCooled = account.quotaResetAt && account.quotaResetAt > now;
+    account.quotaResetAt = now + quotaCooldownMs();
+    if (!alreadyCooled) {
+      bumpConnect('quota_exhausted');
+      log.warn(`Account ${safeAccountRef(account)} quota dry (weekly ${w}%) — quota cooldown ${Math.round(quotaCooldownMs() / 60000)}m (self-healing)`);
+    }
+  } else if (account.quotaResetAt) {
+    // Balance recovered → clear ONLY the quota dimension, never the transient one.
+    account.quotaResetAt = 0;
+    log.info(`Account ${safeAccountRef(account)} quota recovered (weekly ${w}%) — quota cooldown cleared`);
+  }
+}
+
+/**
+ * R6: cool an account that returned a live QUOTA_EXHAUSTED on the SAME quota
+ * dimension a proactive credits snapshot uses (account.quotaResetAt), not the
+ * transient rateLimitedUntil. Both a reactive 402 and a proactive snapshot now
+ * converge on one self-healing dimension, so isRateLimitedForModel's quota check
+ * (auth.js) sees them identically and a later balance-recovery snapshot clears
+ * either. Previously chat.js wrote a live 402 to rateLimitedUntil while snapshots
+ * wrote quotaResetAt — a Math.max let them coexist, but the two dimensions could
+ * silently disagree on when the account was usable again (consistency bug).
+ * Honors WINDSURFAPI_QUOTA_COOLDOWN=0 (disable) and the shared cooldown default.
+ */
+export function markQuotaExhausted(apiKey, durationMs = null, now = Date.now()) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  if (!account || !quotaCooldownEnabled()) return;
+  // 't' (throttle) not 'd' (dead): a quota dry-well is self-healing, so it should
+  // de-prioritize selection the same light amount the old markRateLimited path did
+  // — R6 changes only the cooldown DIMENSION, not the health weighting.
+  recordHealthEvent(account, 't');
+  const ms = Number.isFinite(durationMs) && durationMs >= 1000 ? durationMs : quotaCooldownMs();
+  const alreadyCooled = account.quotaResetAt && account.quotaResetAt > now;
+  account.quotaResetAt = Math.max(account.quotaResetAt || 0, now + ms);
+  if (!alreadyCooled) {
+    log.warn(`Account ${safeAccountRef(account)} QUOTA_EXHAUSTED (live 402) — quota cooldown ${Math.round(ms / 60000)}m (self-healing)`);
+  }
+}
+
 function maybeRecoverErrorAccount(account, now) {
   if (!account || account.status !== 'error') return;
   const since = account.erroredAt || account._errorAt || 0;
@@ -1218,14 +1708,21 @@ function maybeRecoverErrorAccount(account, now) {
   account.status = 'active';
   account.errorCount = 0;
   log.info(`Account ${safeAccountRef(account)} half-open recovery after ${Math.round((now - since) / 60000)}m in error state`);
+  trySyncModelCatalog();
 }
 
 /**
  * Check if an account is rate-limited for a specific model.
  */
 function isRateLimitedForModel(account, modelKey, now) {
-  // Global rate limit
+  // Global rate limit (transient dimension — short cooldowns)
   if (account.rateLimitedUntil && account.rateLimitedUntil > now) return true;
+  // RB2/B6: quota dimension — a long, self-healing cooldown kept SEPARATE from
+  // the transient rateLimitedUntil so the two never clobber one another. It
+  // expires on its own and is cleared early when a refresh sees the balance
+  // recover (applyQuotaSnapshot). Account-wide (quota refills per billing
+  // cycle, not per model), so it applies regardless of modelKey.
+  if (account.quotaResetAt && account.quotaResetAt > now) return true;
   // Per-model rate limit
   if (modelKey && account._modelRateLimits) {
     const until = account._modelRateLimits[modelKey];
@@ -1248,6 +1745,7 @@ export function reportError(apiKey, { windowMs = 30 * 60 * 1000 } = {}) {
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
   const now = Date.now();
+  recordHealthEvent(account, 'e', now);
   const last = account._errorAt || 0;
   // A stale streak (older than the window) starts over rather than carrying
   // a months-old failure count into a fresh blip.
@@ -1256,6 +1754,29 @@ export function reportError(apiKey, { windowMs = 30 * 60 * 1000 } = {}) {
   if (account.errorCount >= 3 && account.status !== 'error') {
     account.status = 'error';
     account.erroredAt = now;
+    // RB2/B1: account-level EXPONENTIAL BACKOFF. Each consecutive error EPISODE
+    // (a half-open trial that fails again — see maybeRecoverErrorAccount +
+    // reportSuccess clearing _breakerStreak) lengthens the self-healing cooldown
+    // base * factor^(streak-1), HARD-CAPPED at breakerMaxMs() (60min default).
+    //
+    // transient-first: this only stretches an EXISTING self-healing cooldown —
+    // it writes the existing rateLimitedUntil (auto-expires) alongside the
+    // status='error' half-open path, so there are TWO independent recovery
+    // routes and NO permanent disable. Capped → a wobbling account is always
+    // eligible again after the cap. Transients never reach reportError, so they
+    // can't be escalated here.
+    //
+    // streak 1 applies NO extra cooldown (base==recovery TTL, the half-open path
+    // already governs that window) so first-episode behaviour matches today;
+    // only repeat offenders (streak >= 2) get pushed further out. New accounts
+    // (T3b) are exempt from escalation so onboarding wobble can't ramp up.
+    account._breakerStreak = (account._breakerStreak || 0) + 1;
+    if (breakerEnabled() && account._breakerStreak >= 2 && !isNewAccount(account, now)) {
+      const raw = breakerBaseMs() * Math.pow(breakerFactor(), account._breakerStreak - 1);
+      const cooldown = Math.min(raw, breakerMaxMs());
+      account.rateLimitedUntil = Math.max(account.rateLimitedUntil || 0, now + cooldown);
+      log.warn(`Account ${safeAccountRef(account)} backoff streak=${account._breakerStreak} → cooldown ${Math.round(cooldown / 60000)}m (capped ${Math.round(breakerMaxMs() / 60000)}m, self-healing)`);
+    }
     // AP-BUG-1: persist the status flip so a restart doesn't resurrect a
     // known-bad key (reportBanSignal already saves on its flip; this mirrors
     // it). Only saves when the status actually changes, not on every error.
@@ -1270,11 +1791,18 @@ export function reportError(apiKey, { windowMs = 30 * 60 * 1000 } = {}) {
 export function reportSuccess(apiKey) {
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
+  recordHealthEvent(account, 'o');
   if (account.errorCount > 0) {
     account.errorCount = 0;
     account.status = 'active';
+    trySyncModelCatalog();
   }
   account.internalErrorStreak = 0;
+  // RB2/B1: a genuine success ends the error-episode chain → reset the
+  // exponential-backoff streak so a recovered account starts the ladder from
+  // scratch next time (key self-healing guarantee: good behaviour fully clears
+  // the penalty, the backoff is never sticky).
+  if (account._breakerStreak) account._breakerStreak = 0;
   // v2.0.56: any successful chat clears the ban-signal streak — Windsurf's
   // "Authentication failed" can fire transiently during deploys, so we
   // only mark banned when the streak isn't broken by a real success.
@@ -1293,11 +1821,24 @@ export function reportSuccess(apiKey) {
 export function reportInternalError(apiKey) {
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
+  recordHealthEvent(account, 'e');
   account.internalErrorStreak = (account.internalErrorStreak || 0) + 1;
   if (account.internalErrorStreak >= 2) {
     account.rateLimitedUntil = Date.now() + 5 * 60 * 1000;
     log.warn(`Account ${safeAccountRef(account)} quarantined 5min after ${account.internalErrorStreak} consecutive upstream internal errors`);
   }
+}
+
+/**
+ * C5: record that an account's session token came back dead (UNAUTHORIZED on a
+ * failover hop). Status handling lives in the failover/relogin path; this only
+ * feeds the rolling health window so "how many dead-token hits in the last
+ * hour" is visible per account.
+ */
+export function reportDeadToken(apiKey) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  if (!account) return;
+  recordHealthEvent(account, 'd');
 }
 
 // v2.0.56 (windsurf-assistant-pub inspiration): suspect-ban detection.
@@ -1394,6 +1935,12 @@ export function isAllRateLimited(modelKey) {
     if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
       soonestExpiry = Math.min(soonestExpiry, a.rateLimitedUntil);
     }
+    // RB2/B2: a quota cooldown also gates this account → include its deadline so
+    // Retry-After reflects when the soonest account actually frees up (else a
+    // quota-only-cooled pool would always report the conservative 60s default).
+    if (a.quotaResetAt && a.quotaResetAt > now) {
+      soonestExpiry = Math.min(soonestExpiry, a.quotaResetAt);
+    }
     if (modelKey && a._modelRateLimits?.[modelKey] > now) {
       soonestExpiry = Math.min(soonestExpiry, a._modelRateLimits[modelKey]);
     }
@@ -1417,6 +1964,14 @@ export function isAllTemporarilyUnavailable(modelKey) {
 
     if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
       soonestExpiry = Math.min(soonestExpiry, a.rateLimitedUntil);
+      continue;
+    }
+
+    // RB2/B2: a quota-cooled account is also unavailable for selection (getApiKey
+    // filters it via isRateLimitedForModel) — treat it as such here too, else
+    // this would falsely report the account as available.
+    if (a.quotaResetAt && a.quotaResetAt > now) {
+      soonestExpiry = Math.min(soonestExpiry, a.quotaResetAt);
       continue;
     }
 
@@ -1592,6 +2147,12 @@ export async function refreshCredits(id) {
     // downstream callers (e.g. model catalog cache) to inspect once.
     const { raw, ...persist } = status;
     account.credits = persist;
+    // RB2/B2+B3+B6: react to the fresh balance snapshot. A dry account is
+    // pre-cooled on its own quotaResetAt dimension (so getApiKey stops handing
+    // it out to eat 402s) and a recovered account is uncooled immediately. This
+    // rides the existing 15-min refreshAllCredits timer (B3) — no new timer.
+    // Self-healing and NEVER permanent (see applyQuotaSnapshot).
+    applyQuotaSnapshot(account, persist.weeklyPercent);
     // Tier hint: if the plan info is explicit, prefer it over capability probing.
     // Trial / individual accounts also count as pro — Windsurf returns
     // "INDIVIDUAL" / "TRIAL" / similar for paid-tier trials (issue #8 follow-up:
@@ -2068,11 +2629,52 @@ const LOCKOUT_THRESHOLD = 5;
 const LOCKOUT_DURATION_MS = 30 * 60 * 1000;
 const LOCKOUT_IDLE_TTL_MS = 2 * 60 * 60 * 1000;
 const LOCKOUT_CLEANUP_MS = 60 * 60 * 1000;
+// LOCK-2 (audit P1, unauth-reachable): the per-IP lockout Map is reached
+// BEFORE the API-key gate (dashboard auth failures), so an attacker who can
+// present distinct source IPs (spoofed XFF pre-fix, IPv6 /64 rotation, a
+// botnet) could grow this Map without bound and OOM the single process. Cap
+// the number of tracked IPs and evict the oldest non-banned entry when full
+// so distinct-IP floods can't exhaust memory — and can't wipe a live ban.
+function _defaultLockoutMax() {
+  const raw = Number(process.env.LOCKOUT_MAX_ENTRIES);
+  return Number.isInteger(raw) && raw > 0 ? raw : 50000;
+}
+let _lockoutMaxEntries = _defaultLockoutMax();
+// Bounded scan budget: how many leading (oldest) entries we may skip past
+// while looking for an evictable (non-banned) one before giving up. Keeps
+// the per-insert cost O(1) amortized even in the pathological all-banned case.
+const _LOCKOUT_EVICT_SCAN_BUDGET = 64;
 const _lockoutAttempts = new Map();
 
 function _now() { return Date.now(); }
 
 export function _resetLockoutForTests() { _lockoutAttempts.clear(); }
+
+// Test seam: override the hard cap (returns the previous value) so the LOCK-2
+// regression can prove the bound with a small map instead of allocating 50k.
+export function __setLockoutMaxForTests(n) {
+  const prev = _lockoutMaxEntries;
+  _lockoutMaxEntries = Number.isInteger(n) && n > 0 ? n : _defaultLockoutMax();
+  return prev;
+}
+export function __lockoutSizeForTests() { return _lockoutAttempts.size; }
+
+// Reclaim one slot for a NEW ip when the Map is at capacity. Evicts the oldest
+// (insertion-order) entry that is NOT under an active ban, so a distinct-IP
+// flood stays memory-bounded without ever releasing a live lockout early.
+// Returns true if a slot was freed. Bounded by _LOCKOUT_EVICT_SCAN_BUDGET.
+function _evictLockoutForInsert(now) {
+  let scanned = 0;
+  for (const [ip, e] of _lockoutAttempts) {
+    if (e.blockedUntil > now) {
+      if (++scanned >= _LOCKOUT_EVICT_SCAN_BUDGET) break;
+      continue;
+    }
+    _lockoutAttempts.delete(ip);
+    return true;
+  }
+  return false;
+}
 
 export function getLockoutState(ip) {
   if (!ip) return { count: 0, blockedUntil: 0 };
@@ -2109,6 +2711,13 @@ export function failedAuthAttempt(ip) {
   const now = _now();
   let e = _lockoutAttempts.get(ip);
   if (!e) {
+    // LOCK-2: enforce the hard cap before inserting a brand-new IP. If we're
+    // at capacity, evict the oldest non-banned entry; if every slot is a live
+    // ban (can't happen with a sane cap, but guard anyway) short-circuit and
+    // don't create a record — the flood can't grow memory past the bound.
+    if (_lockoutAttempts.size >= _lockoutMaxEntries && !_evictLockoutForInsert(now)) {
+      return { blocked: false, retryAfterMs: 0, count: 0 };
+    }
     e = { count: 0, blockedUntil: 0, lastActivity: now };
     _lockoutAttempts.set(ip, e);
   }
@@ -2283,7 +2892,8 @@ export async function initAuth() {
 
   // Fetch live model catalog from cloud and merge into hardcoded catalog.
   // Fire-and-forget — the hardcoded catalog is sufficient until this completes.
-  fetchAndMergeModelCatalog().catch(e => log.warn(`Model catalog fetch: ${e.message}`));
+  // trySyncModelCatalog also fires again when the first account becomes active.
+  trySyncModelCatalog();
 
   // Periodic Firebase token refresh (every 50 min). Firebase ID tokens expire
   // after 60 min; refreshing at 50 keeps a comfortable margin.
@@ -2292,6 +2902,24 @@ export async function initAuth() {
   setInterval(() => {
     refreshAllFirebaseTokens({ skipBusy: skipBusyMaintenance }).catch(e => log.warn(`Scheduled token refresh: ${e.message}`));
   }, TOKEN_REFRESH_INTERVAL).unref?.();
+
+  // Periodic DEVIN_CONNECT session-token liveness sweep. The session_id has no
+  // refresh path, so a zero-billable GetUserStatus probe is the only way to spot
+  // a retired token before a user request hits it. Opt-in via
+  // DEVIN_CONNECT_LIVENESS_PROBE=1 since it adds a periodic upstream call per
+  // session-token account; pairs with DEVIN_CONNECT_AUTO_RELOGIN for recovery.
+  if (String(process.env.DEVIN_CONNECT_LIVENESS_PROBE || '') === '1') {
+    const LIVENESS_INTERVAL = Number(process.env.DEVIN_CONNECT_LIVENESS_INTERVAL_MS) || 10 * 60 * 1000;
+    const sweep = async () => {
+      for (const a of accounts) {
+        if (!String(a.apiKey || '').startsWith('devin-session-token$')) continue;
+        try { await probeAndRecoverConnectAccount(a.id); }
+        catch (e) { log.warn(`Liveness sweep ${a.id} failed: ${e.message}`); }
+      }
+    };
+    setInterval(() => { sweep().catch(e => log.warn(`Liveness sweep: ${e.message}`)); }, LIVENESS_INTERVAL).unref?.();
+    log.info(`DEVIN_CONNECT liveness probe enabled (every ${Math.round(LIVENESS_INTERVAL / 60000)}m)`);
+  }
 
   // Warm up the default LS so first chat avoids spawn cost. Proxy-specific
   // LS instances are on-demand by default: current LS builds can consume

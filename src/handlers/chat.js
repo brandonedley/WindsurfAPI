@@ -5,15 +5,13 @@
 
 import { createHash, randomUUID } from 'crypto';
 import { WindsurfClient, contentToString, isCascadeTransportError, getChatMessageWithTools } from '../client.js';
-import { STOP_REASON, stopReasonToFinishReason } from '../getchatmessage.js';
-import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary } from '../auth.js';
+import { getApiKey, acquireAccountByKey, releaseAccount, releaseAccountById, currentApiKeyForId, getAccountAvailability, reportError, reportSuccess, markRateLimited, markQuotaExhausted, reportInternalError, reportDeadToken, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation, looksLikeBanSignal, reportBanSignal, clearBanSignals, isModelBlockedByDrought, getDroughtSummary, reLoginAccount, getAccountCount } from '../auth.js';
 import { isStickyEnabled, setStickyBinding } from '../account/sticky-session.js';
 import { resolveModel, getModelInfo, pickRateLimitFallback, supportsToolCalls } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
 import { safeAccountRef, safeKeyRef } from '../log-safety.js';
 import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
-import { recordUpstreamSend, onRateLimitLockout, shouldSoftLimitAccount, awaitSendSlot } from '../quota-window.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative } from './intent-extractor.js';
 import { markRequest as markQuietWindowRequest } from '../dashboard/quiet-window-updater.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
@@ -39,12 +37,16 @@ import {
   handleSpecialAgentChatCompletion,
 } from '../special-agent.js';
 import { selectBackend, usesCascadeFlow, BACKEND } from '../backend-router.js';
+import { STOP_REASON, stopReasonToFinishReason } from '../getchatmessage.js';
+import { recordUpstreamSend, onRateLimitLockout, shouldSoftLimitAccount, awaitSendSlot } from '../quota-window.js';
+import { toChatCompletion as _toChatCompletion, streamChatCompletion as _streamChatCompletion } from '../devin-connect-openai.js';
+import { resolveConnectSelector } from '../devin-connect-models.js';
+import { isRetryable as isConnectRetryable, getToolDefTags, parseToolCallTagMap } from '../devin-connect.js';
+import { isRouterModel, assignModel } from '../devin-connect-catalog.js';
+import { bumpConnect } from '../devin-connect-metrics.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
+import { systemFingerprint } from '../system-fingerprint.js';
 import { registerSseController } from '../sse-registry.js';
-import { prepareHermesDevinRequest } from '../hermes-devin/adapter.js';
-import { buildAdapterErrorResponse } from '../hermes-devin/errors.js';
-import { buildHermesDevinToolGateway } from '../hermes-devin/tool-gateway.js';
-import { executeHermesDevinAcpChat, shouldUseHermesDevinAcpBackend } from '../hermes-devin/acp-backend.js';
 import {
   recordNativeBridgeAccountGateReject,
   recordNativeBridgeAccountGateSkip,
@@ -150,6 +152,7 @@ export function mapGetChatMessageResultToChoice(parsed, tools) {
   };
 }
 
+
 // Build the option bag the v2.0.25 semantic key needs. tools / tool_choice /
 // preamble are baked into the digest so a tool schema change misses instead
 // of silently resuming a cascade where the upstream model has the old tool
@@ -238,17 +241,11 @@ export function buildToolRoutingPlan(tools, { useCascade = false, modelKey = '',
   const { partition, ...nativeDecisionSummary } = nativeDecision;
   const nativeBridgeOn = !!nativeDecision.enabled;
   const emulationTools = nativeBridgeOn ? partition.unmapped : (tools || []);
-  const hermesDevinGateway = buildHermesDevinToolGateway(tools || [], {
-    nativeToolNames: nativeBridgeOn
-      ? partition.mapped.map(t => t?.function?.name).filter(Boolean)
-      : [],
-  });
   return {
     hasTools,
     partition,
     nativeBridgeOn,
     nativeDecision: nativeDecisionSummary,
-    hermesDevinGateway,
     emulationTools,
     nativeCallerTools: nativeBridgeOn ? partition.mapped : [],
     shouldBuildToolPreamble: Array.isArray(emulationTools) && emulationTools.length > 0,
@@ -324,6 +321,14 @@ export function filterToolCallsByAllowlist(toolCalls, tools) {
 export function effectiveToolsForToolChoice(tools, toolChoice) {
   if (!Array.isArray(tools) || tools.length === 0) return tools || [];
   if (toolChoice === 'none') return [];
+  // O5: 'required'/'any' (Anthropic-normalized 'any' → 'required') keeps the
+  // FULL tool set available — the "must call ≥1" constraint is enforced in the
+  // preamble (resolveToolChoice) and surfaced in diagnostics, NOT by narrowing
+  // tools[] here. Only a forced {function:{name}} object narrows the set. This
+  // is why 'required' intentionally falls through to `return tools` below —
+  // it must NOT be conflated with the 'none' (empty) branch.
+  // NB: OpenAI 400s on required + empty tools[]; we early-return above instead
+  // (that boundary check belongs to input validation, not O5). TODO(none — FREE).
   let forced = '';
   if (toolChoice && typeof toolChoice === 'object') {
     forced = toolChoice.function?.name || toolChoice.name || '';
@@ -345,7 +350,17 @@ export function summarizeToolRoutingDiagnostics({ tools, effectiveTools, toolCho
     : '';
   const reasons = [];
 
+  // O5: classify tool_choice so 'required' is never silently equated to 'auto'
+  // in logs/diag. String 'required'/'any' → must call ≥1 tool; forced object →
+  // must call the named tool (surfaced separately via forcedName below).
+  const toolChoiceMode = forcedName
+    ? 'forced'
+    : (toolChoice === 'required' || toolChoice === 'any')
+      ? 'required'
+      : (toolChoice === 'none' ? 'none' : 'auto');
+
   if (toolChoice === 'none') reasons.push('tool_choice_none');
+  if (toolChoiceMode === 'required') reasons.push('tool_choice_required');
   if (forcedName && requested.length && !requested.includes(forcedName)) reasons.push('forced_tool_not_declared');
   if (requested.length && effective.length === 0 && toolChoice !== 'none') reasons.push('effective_tools_empty');
   if (toolRouting?.nativeDecision?.reason) reasons.push(toolRouting.nativeDecision.reason);
@@ -361,10 +376,10 @@ export function summarizeToolRoutingDiagnostics({ tools, effectiveTools, toolCho
     unmapped: toolNameList(toolRouting?.partition?.unmapped || []),
     nativeBridgeOn: !!toolRouting?.nativeBridgeOn,
     nativeDecisionReason: toolRouting?.nativeDecision?.reason || '',
-    gateway: toolRouting?.hermesDevinGateway?.summary || null,
     preambleTier: preambleBudget?.tier || null,
     preambleBytes: preambleBudget?.finalBytes ?? null,
     forcedName,
+    toolChoiceMode,
     reasons: [...new Set(reasons)],
   };
 }
@@ -386,13 +401,6 @@ function bridgeResultList(values) {
     .map(v => String(v || '').replace(/[\r\n\t]/g, ' ').trim().slice(0, 80))
     .filter(Boolean);
   return [...new Set(list)].slice(0, 50).join(',') || 'none';
-}
-
-
-function looksLikeNarratedToolIntent(text) {
-  if (typeof text !== 'string' || !text.trim()) return false;
-  return /(?:\b(?:I'?ll|I will|Let me|I'?m going to|I should|I need to|The user wants me to)\b|(?:我会|我将|让我|需要|应该)).{0,120}\b(?:call|use|invoke|run|execute|read|search|write|edit|list)\b/i.test(text)
-    || /(?:调用|使用|运行|执行|读取|搜索|写入|编辑|列出)/i.test(text);
 }
 
 function logBridgeResultDiagnostics(reqId, diag) {
@@ -435,12 +443,6 @@ export function chatStreamError(message, type = 'upstream_error', code = null) {
   return { error: { message: sanitizeText(message || 'Upstream stream error'), type, code } };
 }
 
-// ─── OpenAI error vocabulary + connect error mapping ─────────────────
-// Ported verbatim from upstream chat.js (Phase 1 of the upstream merge):
-// gemini.js / messages.js / responses.js / server.js import these at module
-// load. The devin-connect dispatch that FEEDS connectErrorToHttp arrives in
-// Phase 2 — until then it only serves the error-shaping call sites.
-
 /**
  * Map a DEVIN_CONNECT classified error code (from devin-connect.js
  * classifyUpstreamError) to the OpenAI-shaped HTTP status + error type. A
@@ -459,6 +461,22 @@ export function connectErrorToHttp(code) {
     case 'TIMEOUT': return { status: 504, type: 'timeout_error' };
     default: return { status: 502, type: 'upstream_error' };
   }
+}
+
+// R1: which classified upstream errors describe an ACCOUNT-specific dry-well
+// that a *different* pooled account could satisfy — so the request should fail
+// over instead of surfacing 402/429 to the client while healthy accounts sit
+// idle. QUOTA_EXHAUSTED (out of credit) and RATE_LIMITED (this account throttled)
+// are per-account: finalizeConnectAccount already cools the offending account, so
+// the next hop lands on a funded/un-throttled one. Deliberately EXCLUDED:
+//   - CAPACITY / UPSTREAM_INTERNAL: the MODEL is overloaded or the backend hiccuped
+//     — not an account fault. Failing over would storm every account with the same
+//     doomed request; these are handled by in-place replay + short soft cooldown.
+//   - MODEL_BLOCKED: a tier/entitlement wall shared by every account of that tier
+//     (free→paid selector) — the next account would reject identically.
+//   - UNAUTHORIZED: already handled by the dead-token failover path (kind:'dead').
+export function isAccountFailoverError(code) {
+  return code === 'QUOTA_EXHAUSTED' || code === 'RATE_LIMITED';
 }
 
 // O10: official OpenAI error `type` vocabulary. Anything outside this set that
@@ -620,6 +638,7 @@ function wrapNonStreamCompletionAsSse(result) {
     },
   };
 }
+
 
 /**
  * v2.0.71 (#115 server-side fabricate detection): when a tool-emulation
@@ -1594,6 +1613,21 @@ function estimateTokens(messages) {
   return Math.max(1, Math.ceil(chars / 4));
 }
 
+// O11: estimate reasoning (thinking) tokens with the same chars/4 heuristic used
+// for completion tokens, so a client that reads
+// usage.completion_tokens_details.reasoning_tokens sees a non-zero value whenever
+// the model actually produced thinking content (previously hardcoded 0 even with
+// visible reasoning). OpenAI's invariant is reasoning_tokens ⊆ completion_tokens,
+// so the estimate is clamped to the reported completion count — never larger than
+// the whole, and never negative.
+function estimateReasoningTokens(thinkingText, completionTokens) {
+  const t = typeof thinkingText === 'string' ? thinkingText : '';
+  if (!t.length) return 0;
+  const est = Math.ceil(t.length / 4);
+  const cap = Number.isFinite(completionTokens) ? Math.max(0, completionTokens) : est;
+  return Math.min(est, cap);
+}
+
 function cachedUsage(messages, completionText) {
   const prompt = estimateTokens(messages);
   const completion = Math.max(1, Math.ceil((completionText || '').length / 4));
@@ -1719,7 +1753,10 @@ export function buildUsageBody(serverUsage, messages, completionText, thinkingTe
       input_tokens: promptTokens,
       output_tokens: outputTokens,
       prompt_tokens_details: { cached_tokens: cacheRead },
-      completion_tokens_details: { reasoning_tokens: 0 },
+      // O11: reasoning_tokens is a subset of completion_tokens (here == the
+      // upstream outputTokens, which already accounts for thinking output), so
+      // clamp the estimate to it.
+      completion_tokens_details: { reasoning_tokens: estimateReasoningTokens(thinkingText, outputTokens) },
       cache_creation_input_tokens: cacheWrite,
       cache_read_input_tokens: cacheRead,
       cache_creation: cacheCreationSplit,
@@ -1743,8 +1780,150 @@ export function buildUsageBody(serverUsage, messages, completionText, thinkingTe
     input_tokens: prompt,
     output_tokens: completion,
     prompt_tokens_details: { cached_tokens: 0 },
-    completion_tokens_details: { reasoning_tokens: 0 },
+    // O11: completion here already folds thinkingText into the chars/4 estimate,
+    // so reasoning_tokens is the thinking portion of that same total (⊆ completion).
+    completion_tokens_details: { reasoning_tokens: estimateReasoningTokens(thinkingText, completion) },
   };
+}
+
+// ── DEVIN_CONNECT account lifecycle ──────────────────────────────────
+// Indirection layer for the connect network calls + re-login, so the failover
+// loop below can be exercised offline. Production wires the real modules;
+// __setConnectDeps swaps in fakes for tests, __resetConnectDeps restores.
+let _connectDeps = {
+  toChatCompletion: _toChatCompletion,
+  streamChatCompletion: _streamChatCompletion,
+};
+function toChatCompletion(...args) { return _connectDeps.toChatCompletion(...args); }
+function streamChatCompletion(...args) { return _connectDeps.streamChatCompletion(...args); }
+export function __setConnectDeps(overrides = {}) { _connectDeps = { ..._connectDeps, ...overrides }; }
+export function __resetConnectDeps() {
+  _connectDeps = { toChatCompletion: _toChatCompletion, streamChatCompletion: _streamChatCompletion };
+}
+
+// The connect path is token-based: it needs a Windsurf session key, which the
+// account pool already manages (rotation, RPM budget, rate-limit cooldowns).
+// We acquire from the pool so connect requests rotate and count toward quota
+// just like Cascade requests. If the pool is empty (operator only set
+// WINDSURF_API_KEY/DEVIN_CONNECT_TOKEN in env), acct is null and the connect
+// client falls back to the env token — so a single-token deploy still works.
+//
+// Account selection passes modelKey=null: connect selectors (swe-1-6-slow,
+// claude-*-medium) are a different namespace from the Cascade catalog, so the
+// per-account model-allow filter must not exclude otherwise-usable accounts.
+async function acquireConnectAccount(signal, callerKey) {
+  // Empty pool (single-token deploy: only WINDSURF_API_KEY/DEVIN_CONNECT_TOKEN
+  // in env) → there is nothing to wait for. Return null immediately for the
+  // env-token fallback instead of blocking QUEUE_MAX_WAIT_MS on every request.
+  if (getAccountCount().total === 0) return null;
+  const tried = [];
+  const acct = await waitForAccount(tried, signal, QUEUE_MAX_WAIT_MS, null, callerKey);
+  return acct; // may be null → env-token fallback
+}
+
+// Cross-account failover for DEVIN_CONNECT. When the current account's token is
+// dead (UNAUTHORIZED) and same-account re-login couldn't mint a fresh one — the
+// account was added by raw token (no stored password), or the re-login itself
+// failed — we fall through to the NEXT healthy pooled account instead of failing
+// the request. `triedKeys` carries every key already burned this request so
+// getApiKey never re-picks a known-dead account. Returns the next account or
+// null when no untried account is available.
+//
+// Unlike the initial acquire this does NOT block on the queue: a dead account
+// never re-enters the pool as "untried", so waiting on the queue deadline would
+// just stall the request for QUEUE_MAX_WAIT_MS before failing. We take whatever
+// untried account is selectable right now, or give up immediately.
+function acquireConnectFailover(triedKeys, signal, callerKey) {
+  if (signal?.aborted) return null;
+  return getApiKey(triedKeys, null, callerKey);
+}
+
+// How many times a single DEVIN_CONNECT request may hop to a fresh pooled
+// account after a dead-token failure. 0 disables failover (same-account
+// re-login still applies). Default 2 so a request survives a couple of stale
+// session tokens without fanning out across the whole pool.
+function connectFailoverMax(env = process.env) {
+  const raw = Number(env.DEVIN_CONNECT_FAILOVER_MAX);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+}
+
+// Pair with acquireConnectAccount on every exit path. Records billing/stats and
+// returns the account to the pool. `err` null ⇒ success.
+export function finalizeConnectAccount(acct, { model, startTime, err }) {
+  if (!acct) {
+    // env-token path: still record the request for dashboard totals.
+    recordRequest(model, !err, Date.now() - startTime, null);
+    return;
+  }
+  // REF-1/REF-2: acct.apiKey is a snapshot taken at acquire time. A background
+  // re-login (UNAUTHORIZED path below) swaps the pool object's apiKey in place
+  // without touching this snapshot, so every mark*/report*/release keyed on the
+  // stale snapshot would silently no-op — leaking the in-flight slot and losing
+  // the cooldown/health signal. Resolve the account's CURRENT apiKey via its
+  // immutable id (falls back to the snapshot when the id is unknown), and
+  // release by id so the counter always finds its account.
+  const apiKey = currentApiKeyForId(acct.id, acct.apiKey);
+  if (err) {
+    // A client-side abort (caller disconnected) is not an account fault — just
+    // release without penalizing the account's error budget.
+    const aborted = err.name === 'AbortError' || err.code === 'ABORT_ERR';
+    if (aborted) { /* no penalty */ }
+    // MODEL_BLOCKED is a tier/entitlement wall (free account asked for a paid
+    // selector → upstream "/upgrade"), NOT an account-health problem. Penalizing
+    // it would demote a perfectly good free account toward eviction every time a
+    // client names claude-*/gpt-* — so release cleanly, same as a success.
+    else if (err.code === 'MODEL_BLOCKED') { /* no penalty — tier wall, not a fault */ }
+    else if (err.code === 'QUOTA_EXHAUSTED') {
+      // The account ran out of credit/quota — unlike a tier wall this IS an
+      // account-specific dry-well. Cool it down so getApiKey stops re-selecting
+      // it and serving 402 to every client; failover moves to a funded account.
+      // R6: write the cooldown to the QUOTA dimension (quotaResetAt) — the same
+      // self-healing dimension a proactive credits snapshot uses — not the
+      // transient rateLimitedUntil. This keeps the reactive-402 and proactive-
+      // snapshot views of "is this account quota-dry?" consistent; a later
+      // balance-recovery snapshot then clears it. 30-min cooldown default bounds
+      // the re-probe rate without a hard disable (quota refills per billing cycle).
+      markQuotaExhausted(apiKey, 30 * 60 * 1000);
+      bumpConnect('quota_exhausted');
+    }
+    else if (err.code === 'UNAUTHORIZED') {
+      reportError(apiKey);
+      // The DEVIN_CONNECT session token is an opaque session_id with no refresh
+      // path — UNAUTHORIZED most likely means the server retired it. If the
+      // account has stored credentials + auto-relogin is enabled, trigger a
+      // background re-login (throttled/de-duped in auth.js) so the next request
+      // lands on a fresh token instead of a permanently-dead account.
+      reLoginAccount(acct.id).catch(() => {});
+    }
+    else if (err.code === 'RATE_LIMITED') markRateLimited(apiKey, 5 * 60 * 1000, null);
+    else if (err.code === 'CAPACITY') {
+      // The MODEL is temporarily overloaded ("high demand, try again later") —
+      // a transient upstream condition, NOT an account fault. We already replayed
+      // it in place once; if it still failed, apply a SHORT model-scoped soft
+      // cooldown (60s, auto-recovering via _modelRateLimits) so the pool briefly
+      // prefers another account for THIS model, while the account stays fully
+      // healthy for every other model. No error-budget penalty, no re-login.
+      markRateLimited(apiKey, 60 * 1000, model, 'c');
+      bumpConnect('capacity_throttled');
+    }
+    else if (err.code === 'UPSTREAM_INTERNAL') {
+      // Transient upstream BACKEND fault ("an internal error occurred (trace
+      // ID/error ID: ...)"), often wrapped in a 401/403 auth shell. NOT a dead
+      // token (liveness passes) and NOT an entitlement wall — so no re-login and
+      // no MODEL_BLOCKED escalation (#56/#57 shape, internal-error class).
+      // reportInternalError tracks a consecutive streak (quarantines 5min after
+      // 2 in a row — exactly the persistent backend-fault case) and records a
+      // health-window error so selection de-prioritizes a genuinely sick
+      // account, WITHOUT the errorCount eviction a plain reportError would cause.
+      reportInternalError(apiKey);
+      bumpConnect('upstream_internal');
+    }
+    else reportError(apiKey);
+  } else {
+    reportSuccess(apiKey);
+  }
+  recordRequest(model, !err, Date.now() - startTime, apiKey);
+  releaseAccountById(acct.id);
 }
 
 // Wait until getApiKey returns a non-null account, or until maxWaitMs expires.
@@ -1786,17 +1965,26 @@ export function mergeReasoningEffortIntoModel(reqModel, body) {
     || ''
   ).toLowerCase().trim();
   if (!effort) return reqModel;
-  const VALID = new Set(['minimal', 'none', 'low', 'medium', 'high', 'xhigh']);
+  const VALID = new Set(['minimal', 'none', 'low', 'medium', 'high', 'xhigh', 'max']);
   if (!VALID.has(effort)) return reqModel;
-  // Already has an effort suffix — don't double-stamp.
+  const normalizedEffort = effort === 'minimal' ? 'none' : effort;
+  let baseModel = reqModel;
+  // If the model already carries an effort suffix, replace it with the explicit
+  // request effort instead of treating it as final. Claude Code can send
+  // `claude-opus-4-8-medium` together with `reasoning.effort=xhigh`; the
+  // separate effort field is the caller's current selection and must win.
   for (const e of VALID) {
-    if (reqModel.toLowerCase().endsWith('-' + e)) return reqModel;
+    const suffix = '-' + (e === 'minimal' ? 'none' : e);
+    if (baseModel.toLowerCase().endsWith(suffix)) {
+      baseModel = baseModel.slice(0, -suffix.length);
+      break;
+    }
   }
   // Try the merged form. resolveModel returns the model key if it exists,
   // unchanged input otherwise; getModelInfo returns null for unknown models.
   // Both checks together guard against accidentally inventing a model that
   // doesn't exist in the catalog.
-  const merged = `${reqModel}-${effort === 'minimal' ? 'none' : effort}`;
+  const merged = `${baseModel}-${normalizedEffort}`;
   const resolved = resolveModel(merged);
   if (resolved && getModelInfo(resolved)) return merged;
   return reqModel;
@@ -1903,11 +2091,19 @@ async function _handleChatCompletionsInner(body, context = {}) {
   markQuietWindowRequest();
   const {
     stream = false,
-    max_tokens,
     tools,
     tool_choice,
     response_format,
   } = body;
+  // O3: honor `max_completion_tokens`, the field newer OpenAI SDKs and the o1/o3/
+  // gpt-5 reasoning families send in place of `max_tokens` (which those models
+  // reject outright). Accept either for compatibility and prefer the modern name
+  // when both are present, matching OpenAI's own precedence. Everything downstream
+  // (the connect CompletionConfig at ~1975, cache key) reads this resolved value,
+  // so the two spellings converge to one output cap on every backend path.
+  const max_tokens = Number.isFinite(body.max_completion_tokens)
+    ? body.max_completion_tokens
+    : body.max_tokens;
   const effectiveTools = effectiveToolsForToolChoice(tools, tool_choice);
   // v2.0.66: merge reasoning_effort into the model id BEFORE alias
   // resolution so `gpt-5.5 + reasoning.effort=xhigh` resolves to
@@ -2089,6 +2285,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
     }
   }
 
+
   // Probe diagnostics: dump compact request shape for every call, plus a
   // tail of the last user turn. Keeps us able to see how third-party
   // verifiers (hvoy.ai) actually probe PDF / JSON / thinking capabilities
@@ -2148,6 +2345,26 @@ async function _handleChatCompletionsInner(body, context = {}) {
     }
   }
 
+  // O2: reject n>1 explicitly. OpenAI's `n` asks for N independent
+  // completions, but the Cascade/Devin upstream only ever returns a
+  // single choice (all response paths emit choices:[{index:0}]). Silently
+  // returning one choice would let a client that reads choices[1..n-1]
+  // pick up undefined — a subtler failure than a 400. n=1/null/undefined
+  // (the default) pass through unchanged; only n>1 is refused, matching
+  // OpenAI's own invalid_request_error shape for unsupported values.
+  if (body.n != null && body.n !== 1) {
+    return {
+      status: 400,
+      body: {
+        error: {
+          message: 'This proxy only supports n=1. The upstream backend returns a single completion per request; set n to 1 (or omit it).',
+          type: 'invalid_request_error',
+          param: 'n',
+        },
+      },
+    };
+  }
+
   // Heavy clients (OpenClaw 24KB, opencode + omo, Cline with full tool
   // catalog) ship system prompts that approach Cascade's ~30KB panel-
   // state ceiling. When that happens upstream intermittently returns
@@ -2180,7 +2397,431 @@ async function _handleChatCompletionsInner(body, context = {}) {
   }
   let routingModelKey = effectiveModelKey;
   let modelInfo = getModelInfo(effectiveModelKey) || getModelInfo(modelKey);
-  // Reject unknown models. Without this, chat.js used to fall through to
+
+  // DEVIN_CONNECT short-circuit: the pure-HTTP egress owns its own model
+  // dictionary (devin-connect-models.js → proto #21 selectors), which is a
+  // different namespace from the Cascade catalog. An operator who flips
+  // DEVIN_CONNECT=1 wants every request on that path, so route here BEFORE the
+  // Cascade "Unsupported model" gate — otherwise a connect-only selector like
+  // `swe-1-6-slow` (no Cascade catalog entry) would 400 before ever reaching
+  // the backend. Unmapped names degrade to the free-tier selector downstream.
+  if (selectBackend({ modelInfo }).flow === 'devin_connect') {
+    const reqModelName = reqModel || config.defaultModel;
+    const { selector, mapped } = resolveConnectSelector(reqModelName);
+    // Tool calling: connect selectors have no native function-calling slot, so
+    // we emulate exactly like the Cascade path — inject the tool protocol into
+    // the prompt (normalizeMessagesForCascade folds role:tool history and
+    // prepends a preamble) and parse <tool_call> markup back out downstream
+    // (toChatCompletion / streamChatCompletion with emulateTools). Run the
+    // rewrite BEFORE the connect call so no role:'tool' message survives to
+    // devin-connect.js's non-protocol [tool result] text wrapper.
+    const emulateTools = Array.isArray(effectiveTools) && effectiveTools.length > 0;
+    // Double-send guard (#49): when the native ToolDef gate is calibrated, tools
+    // also ride natively in the #10 `tools` field (connectParams.tools below), so
+    // re-describing them in the prompt preamble is redundant and gives the model
+    // conflicting instructions. Suppress the preamble ONLY when BOTH gates are on:
+    //  - def gate (getToolDefTags): tools are encoded natively, no need to list
+    //    them in prose.
+    //  - call gate (parseToolCallTagMap): the response carries native tool_calls,
+    //    so we don't need the `<tool_call>` markup contract in the preamble either.
+    // If only the def gate is on, the response still comes back as <tool_call>
+    // markup, so the preamble's protocol instructions MUST stay. role:tool /
+    // assistant history folding always runs (still needed until the msg gate lands).
+    const nativeDefsOn = emulateTools && !!getToolDefTags();
+    const nativeCallsOn = !!parseToolCallTagMap();
+    // SOLO calibration mode (DEVIN_CONNECT_TOOL_DEF_SOLO=1, default OFF): force the
+    // preamble OFF whenever the def gate is on, so native #10 tool defs are the
+    // ONLY tool signal reaching the upstream. This is the black-box probe for the
+    // candidate inner tags — if the upstream still understands the tools and emits
+    // a tool_call with the preamble suppressed, the candidate ToolDef tags are
+    // correct. Do NOT enable in production: with unverified inner tags the frame
+    // may be misread. Normal path keeps the preamble unless both gates are on.
+    const soloProbe = nativeDefsOn && String(process.env.DEVIN_CONNECT_TOOL_DEF_SOLO || '') === '1';
+    const suppressPreamble = soloProbe || (nativeDefsOn && nativeCallsOn);
+    if (soloProbe) log.info(`Chat[${reqId}]: DEVIN_CONNECT TOOL_DEF SOLO probe — preamble suppressed, native #10 is the only tool signal`);
+    const connectMessages = emulateTools
+      ? normalizeMessagesForCascade(messages, effectiveTools, { modelKey: reqModelName, provider: null, route: 'devin_connect', toolChoice: tool_choice, injectUserPreamble: !suppressPreamble })
+      : messages;
+    log.info(`Chat[${reqId}]: DEVIN_CONNECT ${reqModelName} -> selector=${selector}${mapped ? '' : ' [unmapped→free-tier]'} stream=${!!stream}${emulateTools ? ` tools=${effectiveTools.length}` : ''}`);
+    const ccId = genId();
+    const ccCreated = Math.floor(Date.now() / 1000);
+    const ccStart = Date.now();
+    // Acquire a pooled account for rotation + quota accounting. null ⇒ either
+    // the pool is empty (single-token deploy → env-token fallback is correct)
+    // OR every account is rate-limited/unavailable (the pool exists but is
+    // exhausted). Those two cases must NOT be conflated: silently serving an
+    // exhausted-pool request on the un-accounted env token hammers one account
+    // toward a ban with zero RPM accounting. Distinguish them and return a
+    // clean 429 for genuine exhaustion instead. (P0-2)
+    //
+    // The check runs BEFORE the queue wait: when the whole pool is rate-limited
+    // there's no point holding the connection for QUEUE_MAX_WAIT_MS (the limit
+    // may be minutes out) — return a fast 429 with an accurate retry_after so
+    // the client backs off. A momentarily-busy (not rate-limited) account still
+    // gets the queue benefit via acquireConnectAccount below.
+    if (getAccountCount().total > 0) {
+      const rl = isAllRateLimited(null);
+      const tu = isAllTemporarilyUnavailable(null);
+      if (rl.allLimited || tu.allUnavailable) {
+        const retryAfterMs = rl.retryAfterMs || tu.retryAfterMs || 60000;
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT pool exhausted (all accounts rate-limited/unavailable) → 429 retry_after=${retryAfterMs}ms`);
+        bumpConnect('pool_exhausted');
+        return {
+          status: 429,
+          headers: { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) },
+          body: { error: { message: `All DEVIN_CONNECT accounts are temporarily rate-limited. Retry in ~${Math.ceil(retryAfterMs / 1000)}s.`, type: 'rate_limit_exceeded', retry_after_ms: retryAfterMs } },
+        };
+      }
+    }
+    const ccAcct = await acquireConnectAccount(context.signal, callerKey);
+    const connectParams = { messages: connectMessages, model: selector };
+    if (ccAcct) connectParams.token = ccAcct.apiKey;
+    // Forward client sampling controls into the connect CompletionConfig. Without
+    // this, temperature/top_p/top_k/max_tokens from the OpenAI (or Anthropic)
+    // request were silently dropped on the DEVIN_CONNECT path — every call ran at
+    // the built-in defaults regardless of what the caller asked for. Only set
+    // keys the caller actually provided; buildCompletionConfig fills the rest with
+    // its calibrated defaults. (NB: max_tokens #3 is not an enforced output cap on
+    // the free tier — see buildCompletionConfig — but it is forwarded for paid.)
+    const completionOverrides = {};
+    if (Number.isFinite(body.temperature)) completionOverrides.temperature = body.temperature;
+    if (Number.isFinite(body.top_p)) completionOverrides.topP = body.top_p;
+    if (Number.isFinite(body.top_k)) completionOverrides.topK = body.top_k;
+    if (Number.isFinite(max_tokens)) completionOverrides.maxTokens = max_tokens;
+    if (Object.keys(completionOverrides).length) connectParams.completion = completionOverrides;
+    // Native tool definitions (groundwork, #49). The connect request builder only
+    // emits a real `tools` field when DEVIN_CONNECT_TOOL_DEF_TAGS is calibrated;
+    // until then this is inert and tools continue to ride the prompt (emulateTools).
+    // Forwarding is harmless when the tag map is unset — the encoder ignores it.
+    if (Array.isArray(effectiveTools) && effectiveTools.length) connectParams.tools = effectiveTools;
+    // Router-model hop (opt-in, default OFF). `adaptive`/`arena-*` are not real
+    // model_uids — the server resolves them per request via the AssignModel RPC,
+    // and GetChatMessage rejects the bare router uid. When DEVIN_CONNECT_ASSIGN_MODEL=1
+    // and the requested name is a router, resolve it to a concrete model_uid here
+    // before the chat call. Gated off by default because the AssignModel wire tags
+    // are inferred (not yet calibrated on a paid account); a failed/empty resolve
+    // degrades gracefully to the original selector rather than failing the request.
+    if (process.env.DEVIN_CONNECT_ASSIGN_MODEL === '1' && isRouterModel(reqModelName) && connectParams.token) {
+      try {
+        const asg = await assignModel({ token: connectParams.token, modelUid: reqModelName, signal: context.signal });
+        connectParams.model = asg.model_uid;
+        log.info(`Chat[${reqId}]: DEVIN_CONNECT router '${reqModelName}' resolved via AssignModel → ${asg.model_uid}`);
+      } catch (e) {
+        bumpConnect('assign_model_failed');
+        log.warn(`Chat[${reqId}]: DEVIN_CONNECT AssignModel for '${reqModelName}' failed (${e.code || 'ERR'}): ${e.message} — falling back to selector=${selector}`);
+      }
+    }
+    // Thread the client's abort signal into the upstream HTTP request so a
+    // disconnected/cancelled caller tears down the in-flight connect call
+    // instead of leaking it until the 120s timeout.
+    if (context.signal) connectParams.signal = context.signal;
+    // O1: honor stream_options.include_usage on the connect path too — the
+    // trailing usage frame is emitted only when the caller opted in.
+    const connectMeta = { id: ccId, created: ccCreated, displayModel: reqModelName, emulateTools, includeUsage: body.stream_options?.include_usage === true };
+    // Shared failover bookkeeping for both stream + non-stream paths. triedKeys
+    // accumulates every session token burned this request so getApiKey never
+    // re-picks a known-dead account when we hop to the next pool member.
+    const triedKeys = [];
+    const maxHops = connectFailoverMax();
+    if (stream) {
+      return {
+        status: 200,
+        stream: true,
+        headers: {
+          'Content-Type': 'text/event-stream',
+          // no-store (not no-cache) so middlebox aggregators like sub2api (#97)
+          // don't priority-cache SSE chunks and replay them for fresh requests.
+          'Cache-Control': 'no-store',
+          'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no',
+        },
+        handler: async (res) => {
+          // Client-disconnect wiring — mirror the Cascade stream path
+          // (streamResponse): a single handler-local AbortController is the
+          // one source of truth for teardown. res 'close' covers both the
+          // direct OpenAI route (real res) and the messages/gemini/responses
+          // routes (their translator fake-res fires 'close' on client
+          // disconnect via _clientDisconnected). context.signal chains in the
+          // server-level/graceful-shutdown abort threaded from the route.
+          const abortController = new AbortController();
+          let unregisterSse = () => {};
+          res.on('close', () => {
+            if (!res.writableEnded) {
+              log.info(`Chat[${reqId}]: DEVIN_CONNECT client disconnected mid-stream, aborting upstream`);
+              abortController.abort();
+            }
+          });
+          if (context.signal) {
+            if (context.signal.aborted) abortController.abort();
+            else context.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+          }
+          let emitted = false;
+          const fp = systemFingerprint(reqModelName);
+          // O10: 仅直连 OpenAI 客户端(route==='chat')在出口归一化 error.type;
+          // messages/gemini/responses 路由写入各自 translator 的 captureRes,
+          // 须保留内部词供其 remap。
+          const isOpenAIClient = (body.__route || 'chat') === 'chat';
+          const send = (data) => {
+            // O9:见 streamResponse 的 send。connect 流的 chunk 由
+            // devin-connect-openai.js 预置 fp(§2.3),此处 == null 守卫防重复注入;
+            // 仅在极少数未预置场景兜底。error 帧不动。
+            if (data && data.object === 'chat.completion.chunk' && data.system_fingerprint == null) {
+              data.system_fingerprint = fp;
+            }
+            if (isOpenAIClient && data && data.error && typeof data.error.type === 'string') {
+              data.error.type = normalizeOpenAIErrorType(data.error.type);
+            }
+            if (!res.writableEnded) { emitted = true; res.write(`data: ${JSON.stringify(data)}\n\n`); }
+          };
+          // Point the upstream connect HTTP call at the handler-local controller
+          // (not the raw context.signal set at request setup) so a client
+          // disconnect — or the server-shutdown abort below — tears down the
+          // in-flight request instead of leaking it until the 120s timeout.
+          connectParams.signal = abortController.signal;
+          // Register with the SSE registry so graceful-shutdown drain can see
+          // this stream and abort it — same contract as the Cascade path. The
+          // finally below guarantees a matching unregister.
+          unregisterSse = registerSseController({
+            abort(reason) {
+              send(chatStreamError(reason || 'server shutting down', 'server_error', 'server_shutdown'));
+              if (!res.writableEnded) {
+                res.write('data: [DONE]\n\n');
+                res.end();
+              }
+              abortController.abort(reason);
+            },
+          });
+          // SSE heartbeat: keep the connection alive through any silent period
+          // (account acquisition, upstream "thinking", failover hops). `:`
+          // prefix is a comment line per the SSE spec — clients ignore it,
+          // intermediaries see bytes flowing, idle timers reset. Same
+          // HEARTBEAT_MS cadence as the Cascade path; the messages/gemini
+          // translators forward the raw comment (see createCaptureRes).
+          const heartbeat = setInterval(() => {
+            if (!res.writableEnded) res.write(': ping\n\n');
+          }, HEARTBEAT_MS);
+          const stopHeartbeat = () => clearInterval(heartbeat);
+          res.on('close', stopHeartbeat);
+          // Run one account through the stream, with same-account re-login as the
+          // first recovery step. Returns 'ok', 'dead' (token unrecoverable on this
+          // account → caller may fail over), or 'error' (non-recoverable). Every
+          // recovery is gated on !emitted: once bytes are on the wire a replay
+          // would duplicate content, so we surface the error instead.
+          const attemptStream = async (a) => {
+            const params = a ? { ...connectParams, token: a.apiKey } : connectParams;
+            try {
+              await streamChatCompletion(params, send, connectMeta);
+              finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: null });
+              return { kind: 'ok' };
+            } catch (err) {
+              // Transient blip (5xx / ECONNRESET / server "unavailable") BEFORE
+              // any byte hit the wire: the non-stream path already retries these
+              // (devin-connect-openai.js maxRetries), but the stream path didn't,
+              // so a one-off upstream hiccup surfaced as a hard error to the
+              // client. Replay once on the SAME token while !emitted — replaying
+              // after bytes are out would duplicate content, so it's gated.
+              if (isConnectRetryable(err) && a && !emitted) {
+                log.info(`Chat[${reqId}]: DEVIN_CONNECT stream transient error (${err.code || err.status}); replaying once on same token`);
+                bumpConnect('transient_replays');
+                try {
+                  await streamChatCompletion(params, send, connectMeta);
+                  finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: null });
+                  return { kind: 'ok' };
+                } catch (retryErr) {
+                  // Retry failed too — fall through to the normal handling below
+                  // (which may still recover an UNAUTHORIZED via re-login, or
+                  // surface the error). Reassign so the branches below see it.
+                  err = retryErr;
+                }
+              }
+              if (err.code === 'UNAUTHORIZED' && a && !emitted) {
+                // No force: honor the 60s re-login cooldown. Concurrent callers
+                // still coalesce on the inflight promise (auth.js), so a dead
+                // token recovers once; sequential bursts within the window reuse
+                // that result instead of each firing a fresh Auth1 login — the
+                // cutover-day storm guard. force:true is reserved for the
+                // scheduled liveness sweep, which is already interval-throttled.
+                const freshKey = await reLoginAccount(a.id).catch(() => false);
+                if (freshKey && !emitted) {
+                  log.info(`Chat[${reqId}]: DEVIN_CONNECT re-login recovered token, replaying stream once`);
+                  try {
+                    await streamChatCompletion({ ...connectParams, token: freshKey }, send, connectMeta);
+                    finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: null });
+                    return { kind: 'ok' };
+                  } catch (retryErr) {
+                    // Fresh token still UNAUTHORIZED ⇒ entitlement wall, not a dead
+                    // session (see non-stream path). Reclassify as MODEL_BLOCKED so
+                    // we surface a clean error instead of storming re-login +
+                    // failover across the pool. Gated on !emitted as always.
+                    const reErr = (retryErr.code === 'UNAUTHORIZED' && !emitted)
+                      ? Object.assign(new Error('model requires a paid Devin entitlement (fresh session token still UNAUTHORIZED → not a dead token)'), { code: 'MODEL_BLOCKED' })
+                      : retryErr;
+                    finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: reErr });
+                    log.error(`Chat[${reqId}]: DEVIN_CONNECT stream retry error: ${reErr.message}`);
+                    return { kind: 'error', err: reErr };
+                  }
+                }
+                finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err });
+                return !emitted ? { kind: 'dead' } : { kind: 'error', err };
+              }
+              finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err });
+              log.error(`Chat[${reqId}]: DEVIN_CONNECT stream error: ${err.message}`);
+              return { kind: 'error', err };
+            }
+          };
+          try {
+            let acct = ccAcct;
+            for (let hops = 0; ; hops++) {
+              // Client gone (disconnect or shutdown abort): stop before touching
+              // another pooled account. Without this the failover loop keeps
+              // hopping fresh accounts — burning quota and holding in-flight
+              // slots — to a socket that will never read the bytes. Checked at
+              // the top of every iteration so it gates each hop, not just the
+              // first attempt.
+              if (abortController.signal.aborted) {
+                log.info(`Chat[${reqId}]: DEVIN_CONNECT stream aborted (client gone) — stopping account failover`);
+                break;
+              }
+              if (acct) triedKeys.push(acct.apiKey);
+              const r = await attemptStream(acct);
+              if (r.kind === 'ok') break;
+              // Re-check after the (awaited) attempt: the client may have hung up
+              // while the upstream call was in flight. Bail before failing over.
+              if (abortController.signal.aborted) {
+                log.info(`Chat[${reqId}]: DEVIN_CONNECT stream aborted (client gone) — not failing over`);
+                break;
+              }
+              if (r.kind === 'error') {
+                // R1: account dry-well (QUOTA/RATE_LIMITED) → fail over to another
+                // pooled account instead of erroring the stream — but ONLY while
+                // !emitted, since replaying after bytes are on the wire would
+                // duplicate content. The offending account is already cooled.
+                if (isAccountFailoverError(r.err.code) && !emitted && hops < maxHops) {
+                  const next = await acquireConnectFailover(triedKeys, abortController.signal, callerKey);
+                  if (next) {
+                    log.info(`Chat[${reqId}]: DEVIN_CONNECT ${r.err.code} on account → stream failover hop ${hops + 1} to next pooled account`);
+                    bumpConnect('quota_failover_hops');
+                    acct = next;
+                    continue;
+                  }
+                }
+                send(chatStreamError(r.err.message, 'upstream_error', r.err.code || null));
+                break;
+              }
+              // r.kind === 'dead' — guaranteed !emitted, so a fresh account is safe.
+              if (acct) reportDeadToken(acct.apiKey);
+              bumpConnect('dead_tokens');
+              if (hops >= maxHops || emitted) { bumpConnect('failover_exhausted'); send(chatStreamError('all DEVIN_CONNECT accounts exhausted (dead session tokens)', 'upstream_error', 'UNAUTHORIZED')); break; }
+              const next = await acquireConnectFailover(triedKeys, abortController.signal, callerKey);
+              if (!next) { bumpConnect('failover_exhausted'); send(chatStreamError('all DEVIN_CONNECT accounts exhausted (dead session tokens)', 'upstream_error', 'UNAUTHORIZED')); break; }
+              log.info(`Chat[${reqId}]: DEVIN_CONNECT failover hop ${hops + 1} → next pooled account`);
+              bumpConnect('failover_hops');
+              acct = next;
+            }
+            if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
+          } finally {
+            unregisterSse();
+            stopHeartbeat();
+          }
+        },
+      };
+    }
+    // Non-streaming: nothing reaches the client until we return, so recovery is
+    // always safe. Same two-step escalation — same-account re-login, then
+    // cross-account failover — wrapped in attempt() per account.
+    const attempt = async (a) => {
+      const params = a ? { ...connectParams, token: a.apiKey } : connectParams;
+      try {
+        const out = await toChatCompletion(params, connectMeta);
+        finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: null });
+        return { kind: 'ok', out };
+      } catch (err) {
+        if (err.code === 'UNAUTHORIZED' && a) {
+          // No force — see the streaming path: honor the 60s cooldown so a
+          // mass token-death event recovers each account once instead of
+          // storming Auth1 with one full login per in-flight request.
+          const freshKey = await reLoginAccount(a.id).catch(() => false);
+          if (freshKey) {
+            log.info(`Chat[${reqId}]: DEVIN_CONNECT re-login recovered token, retrying once`);
+            try {
+              const out = await toChatCompletion({ ...connectParams, token: freshKey }, connectMeta);
+              finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: null });
+              return { kind: 'ok', out };
+            } catch (retryErr) {
+              // The re-login above minted a verifiably-fresh token (windsurfLogin
+              // succeeded), so a SECOND UNAUTHORIZED on that brand-new token cannot
+              // be a dead session — the account simply lacks entitlement for this
+              // selector (free account → paid model). Upstream returns a bare
+              // `permission_denied` with a generic "internal error" body, byte-for-
+              // byte indistinguishable from a retired token; the fresh-token retry
+              // is what disambiguates. Treat it as a tier wall (MODEL_BLOCKED → 402,
+              // no penalty) instead of `dead` — otherwise every free→paid request
+              // would storm Auth1 with a re-login per pooled account and then lie to
+              // the client with "all accounts exhausted (dead session tokens)".
+              const reErr = retryErr.code === 'UNAUTHORIZED'
+                ? Object.assign(new Error('model requires a paid Devin entitlement (fresh session token still UNAUTHORIZED → not a dead token)'), { code: 'MODEL_BLOCKED' })
+                : retryErr;
+              finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err: reErr });
+              log.error(`Chat[${reqId}]: DEVIN_CONNECT retry-after-relogin error (${reErr.code || 'UPSTREAM_ERROR'}): ${reErr.message}`);
+              return { kind: 'error', err: reErr };
+            }
+          }
+          finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err });
+          return { kind: 'dead' };
+        }
+        finalizeConnectAccount(a, { model: reqModelName, startTime: ccStart, err });
+        return { kind: 'error', err };
+      }
+    };
+    let acct = ccAcct;
+    for (let hops = 0; ; hops++) {
+      if (acct) triedKeys.push(acct.apiKey);
+      const r = await attempt(acct);
+      if (r.kind === 'ok') return r.out;
+      if (r.kind === 'error') {
+        // R1: QUOTA_EXHAUSTED / RATE_LIMITED are ACCOUNT dry-wells — the offending
+        // account was just cooled by finalizeConnectAccount, so if the pool still
+        // has another account, move the request there instead of handing the client
+        // a 402/429 while healthy accounts sit idle. Non-stream is always replay-safe
+        // (nothing reached the client yet). Exhausted pool → fall through to surface.
+        if (isAccountFailoverError(r.err.code) && hops < maxHops) {
+          const next = await acquireConnectFailover(triedKeys, context.signal, callerKey);
+          if (next) {
+            log.info(`Chat[${reqId}]: DEVIN_CONNECT ${r.err.code} on account → failover hop ${hops + 1} to next pooled account`);
+            bumpConnect('quota_failover_hops');
+            acct = next;
+            continue;
+          }
+        }
+        // Map the classified upstream code to the right HTTP status/type so a
+        // free-tier /upgrade rejection reads as 402 model_blocked, an auth failure
+        // as 401, and a rate limit as 429 — not a blanket 502.
+        const { status, type } = connectErrorToHttp(r.err.code);
+        log.error(`Chat[${reqId}]: DEVIN_CONNECT error (${r.err.code || 'UPSTREAM_ERROR'} -> ${status}): ${r.err.message}`);
+        return { status, body: { error: { message: r.err.message, type, code: r.err.code || null } } };
+      }
+      // r.kind === 'dead' — the session token couldn't be revived on this account.
+      if (acct) reportDeadToken(acct.apiKey);
+      bumpConnect('dead_tokens');
+      if (hops >= maxHops) {
+        const { status, type } = connectErrorToHttp('UNAUTHORIZED');
+        log.error(`Chat[${reqId}]: DEVIN_CONNECT failover exhausted after ${hops} hop(s)`);
+        bumpConnect('failover_exhausted');
+        return { status, body: { error: { message: 'all DEVIN_CONNECT accounts exhausted (dead session tokens)', type, code: 'UNAUTHORIZED' } } };
+      }
+      const next = await acquireConnectFailover(triedKeys, context.signal, callerKey);
+      if (!next) {
+        const { status, type } = connectErrorToHttp('UNAUTHORIZED');
+        log.error(`Chat[${reqId}]: DEVIN_CONNECT no more pooled accounts for failover`);
+        bumpConnect('failover_exhausted');
+        return { status, body: { error: { message: 'all DEVIN_CONNECT accounts exhausted (dead session tokens)', type, code: 'UNAUTHORIZED' } } };
+      }
+      log.info(`Chat[${reqId}]: DEVIN_CONNECT failover hop ${hops + 1} → next pooled account`);
+      bumpConnect('failover_hops');
+      acct = next;
+    }
+  }
+
   // legacy rawGetChatMessage with modelEnum=0 and modelUid=null, which
   // upstream silently routed to a default model. Callers saw "I'm Claude 4.5"
   // when they asked for `claude-4.6` (issue #68), or got blank responses for
@@ -2234,20 +2875,6 @@ async function _handleChatCompletionsInner(body, context = {}) {
     }
   }
 
-  const hermesDevinPrepared = prepareHermesDevinRequest({
-    requestId: reqId,
-    model: routingModelKey,
-    provider: modelInfo?.provider || null,
-    messages,
-    tools: effectiveTools,
-    stream: !!stream,
-    displayModel,
-  });
-  if (!hermesDevinPrepared.ok) {
-    log.info(`CompatBudget[${reqId}]: action=reject model=${routingModelKey} reason=${hermesDevinPrepared.response.body.error.code}`);
-    return hermesDevinPrepared.response;
-  }
-
   // Backend selection is centralized in backend-router.selectBackend(). This
   // is behaviour-preserving: special_agent → special-agent handler; otherwise
   // useCascade mirrors the legacy `!!(modelUid || modelEnum)`. The router gives
@@ -2264,6 +2891,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       callerKey,
     }, context.specialAgent || {});
   }
+
   const modelEnum = modelInfo?.enumValue || 0;
   const modelUid = modelInfo?.modelUid || null;
   // Cascade requires either a valid modelUid (string) or a recognized modelEnum.
@@ -2339,33 +2967,6 @@ async function _handleChatCompletionsInner(body, context = {}) {
     });
     log.info(`Chat[${reqId}]: native bridge ON — model=${routingModelKey} mapped=[${mappedNames}] unmapped=[${unmappedNames}] allowlist=${nativeAllowlist.join(',')} additional_steps=${nativeAdditionalSteps.length}`);
   }
-  if (shouldUseHermesDevinAcpBackend(body, context.hermesDevinAcp?.env || process.env)) {
-    const acct = await waitForAccountFn(new Set(), null, QUEUE_MAX_WAIT_MS, routingModelKey, callerKey);
-    if (!acct) {
-      return {
-        status: 503,
-        body: { error: { message: 'Hermes Devin ACP backend could not acquire an upstream account.', type: 'backend_unavailable', code: 'acp_account_unavailable' } },
-      };
-    }
-    try {
-      return await executeHermesDevinAcpChat({
-        ...body,
-        id: genId(),
-        created: Math.floor(Date.now() / 1000),
-        model: displayModel,
-        modelKey: routingModelKey,
-        messages,
-        tools: effectiveTools,
-        account: acct,
-        env: context.hermesDevinAcp?.env || process.env,
-      }, {
-        runAcp: context.hermesDevinAcp?.runAcp,
-      });
-    } finally {
-      if (!context.waitForAccount) releaseAccount(acct.apiKey);
-    }
-  }
-
   if (nativeBridgeOn && hasNativeBridgeAccountGate()) {
     const hasAllowedAccount = getAccountList()
       .some(a => a.status === 'active' && isNativeBridgeAccountAllowed(a));
@@ -2501,6 +3102,12 @@ async function _handleChatCompletionsInner(body, context = {}) {
       modelKey: routingModelKey,
       provider: modelInfo?.provider || null,
       route: body.__route || 'chat',
+      // O5: thread tool_choice so required/forced/none reach the user-message
+      // fallback preamble too — the proto tool_calling_section already carries
+      // it via applyToolPreambleBudget, but the fallback (for models that ignore
+      // the proto override) previously hard-coded 'auto'. Mirrors the
+      // DEVIN_CONNECT path above.
+      toolChoice: tool_choice,
     });
   } else {
     cascadeMessages = [...messages];
@@ -2554,17 +3161,6 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // 503 + retry-after instead of letting the request burn its way to
   // an upstream rate-limit. Free-tier models (gemini-2.5-flash etc.)
   // still go through.
-  // Quota governor (flag-gated): same local-refusal pattern as drought mode,
-  // but for the per-model MESSAGE window instead of the weekly credit quota.
-  {
-    const softLimit = shouldSoftLimitAccount(Date.now(), process.env, routingModelKey);
-    if (softLimit.limited) {
-      const retryAfterSec = Math.max(1, Math.ceil(softLimit.retryAfterMs / 1000));
-      log.warn(`Chat[${reqId}]: quota governor [${softLimit.reason}] — account near message cap, refusing ${routingModelKey} locally (retry ${retryAfterSec}s)`);
-      return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 已接近本窗口消息配额（quota governor），请 ${retryAfterSec} 秒后重试或换用其他模型`, type: 'rate_limit_exceeded', retry_after_ms: softLimit.retryAfterMs } } };
-    }
-  }
-
   if (isModelBlockedByDrought(routingModelKey)) {
     const summary = getDroughtSummary();
     const freeList = (summary.freeTierModels || []).slice(0, 4).join(', ') || 'gemini-2.5-flash';
@@ -2649,14 +3245,9 @@ async function _handleChatCompletionsInner(body, context = {}) {
 
   const chatId = genId();
   const created = Math.floor(Date.now() / 1000);
-  const ckey = emulateTools ? null : cacheKey(body, callerKey);
+  const ckey = cacheKey(body, callerKey);
 
-  const forcedFragileNonStream = stream && emulateTools && hasTools && hermesDevinPrepared.modelPolicy.adapterMode === 'fragile_tools';
-  if (forcedFragileNonStream) {
-    log.info(`Chat[${reqId}]: strict adapter forcing non-stream response for fragile emulated tool request so adapter_error can be returned before streaming commits`);
-  }
-
-  if (stream && !forcedFragileNonStream) {
+  if (stream) {
     return streamResponse(
       chatId,
       created,
@@ -2679,6 +3270,13 @@ async function _handleChatCompletionsInner(body, context = {}) {
       waitForAccount: waitForAccountFn,
       cachePolicy,
       wantThinking,
+      // O1: OpenAI only emits the trailing usage-only chunk when the caller opts
+      // in via stream_options.include_usage:true; otherwise a streamed response
+      // carries no usage frame. Passing this through lets streamResponse honor it
+      // instead of unconditionally sending usage (which made some clients
+      // double-count billing). Internal accounting (recordTokenUsage) still runs
+      // regardless — only the client-facing frame is gated.
+      includeUsage: body.stream_options?.include_usage === true,
       fpOpts: buildReuseOpts({ tools: effectiveTools, toolChoice: tool_choice, toolPreamble, preambleTier, emulateTools, route: body.__route || 'chat' }),
       tools: effectiveTools,
       route: body.__route || 'chat',
@@ -2701,6 +3299,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       status: 200,
       body: {
         id: chatId, object: 'chat.completion', created, model: displayModel,
+        system_fingerprint: systemFingerprint(displayModel),
         choices: [{ index: 0, message, finish_reason: 'stop' }],
         usage: cachedUsage(messages, cached.text),
       },
@@ -2848,7 +3447,6 @@ async function _handleChatCompletionsInner(body, context = {}) {
           refundReservation(acct.apiKey, acct.reservationTimestamp);
           if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
             markRateLimited(acct.apiKey, rl.retryAfterMs, routingModelKey);
-            onRateLimitLockout(acct.apiKey, routingModelKey, rl.retryAfterMs);
           }
           if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
             const availability = getAccountAvailability(acct.apiKey, routingModelKey);
@@ -2913,9 +3511,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // re-burning the rate-limit + fallback cycle.
       reqId,
       context.__originalCkey || null,
-      hermesDevinPrepared.modelPolicy.adapterMode === 'fragile_tools',
     );
-    if (forcedFragileNonStream && result.status === 200) return wrapNonStreamCompletionAsSse(result);
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
     if (result.reuseEntryInvalid) reuseEntryDead = true;
@@ -3073,7 +3669,7 @@ async function _handleChatCompletionsInner(body, context = {}) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null, fragileModel = false) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, provider, emulateTools, toolPreamble, wantJson = false, cachePolicy = null, wantThinking = false, tools = [], route = 'chat', nativeOpts = null, reqId = 'non-stream', aliasCkey = null) {
   const startTime = Date.now();
   const nativeBridgeOn = !!nativeOpts?.enabled;
   try {
@@ -3211,6 +3807,23 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         // prompt-injection payloads emit calls for tools the caller
         // never offered, e.g. `Bash` when only `get_weather` is declared).
         toolCalls = filterToolCallsByAllowlist(parsed.toolCalls, tools);
+        // v2.0.146 fix: Opus 4.8 xhigh and other high-reasoning models
+        // sometimes emit <tool_call> blocks inside thinking (reasoning_content)
+        // rather than in the main text response. parseToolCallsFromText only
+        // ran against allText above — scan allThinking as a fallback when
+        // no tool_calls came out of the text pass. Thinking-sourced calls are
+        // always treated as emulation (never native); clear allThinking on
+        // success so the client doesn't see a response that looks like both
+        // a tool_call and a reasoning block at the same time.
+        if (toolCalls.length === 0 && allThinking && allThinking.trim()) {
+          const parsedFromThinking = parseToolCallsFromText(allThinking, { modelKey, provider, route });
+          const fromThinking = filterToolCallsByAllowlist(parsedFromThinking.toolCalls, tools);
+          if (fromThinking.length) {
+            log.info(`Chat[non-stream]: lifted ${fromThinking.length} tool_call(s) from thinking content (model=${modelKey})`);
+            toolCalls = fromThinking;
+            allThinking = '';
+          }
+        }
         bridgeDiag.emulatedToolCalls += toolCalls.length;
         bridgeDiag.emulatedNames.push(...toolCalls.map(tc => tc.name));
         // Diagnostic: emulation was active and the model returned text but no
@@ -3226,12 +3839,13 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         // we see narrate-style tool intents either way. Promotion to
         // allText (line ~2155 below) happens after this; we use the
         // combined source proactively.
-        const narrativeSource = (allText && allText.trim()) ? allText : allThinking;
-        const nluRetryEnabled = process.env.WINDSURFAPI_NLU_RETRY !== '0'
-          && (process.env.WINDSURFAPI_NLU_RETRY === '1'
-              || /zhipu|glm|moonshot|kimi/i.test(String(provider || ''))
-              || /^(?:glm|kimi)/i.test(String(modelKey || '')));
-        let nluRetryAttempted = false;
+        // v2.0.146 fix: always merge both so Opus 4.8 xhigh (and future
+        // high-reasoning models) that place <tool_call> inside thinking
+        // while producing non-empty text don't lose the markup. The old
+        // text-first guard caused markers=xml_tag to be detected (marker
+        // scan already saw combined strings) but NLU recovery ran on
+        // text-only, missing the actual <tool_call> block.
+        const narrativeSource = [allText, allThinking].filter(s => s && s.trim()).join('\n');
         if (toolCalls.length === 0 && narrativeSource) {
           const markers = [];
           if (/<tool_call/i.test(narrativeSource)) markers.push('xml_tag');
@@ -3253,7 +3867,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           // call but the surrounding narrative held everything NLU
           // needs. Restricting NLU to markers=none meant those cases
           // got 0 tool_calls back.
-          if (false && Array.isArray(tools) && tools.length > 0) {
+          if (Array.isArray(tools) && tools.length > 0) {
             const lastUser = latestRealUserText(messages) || '';
             const recovered = extractIntentFromNarrative(narrativeSource, tools, { lastUserText: lastUser, markers });
             if (recovered.length) {
@@ -3287,6 +3901,10 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
           // tools on first pass). Claude/GPT have good first-pass compliance
           // so they only get retry when explicitly opted in. Set
           // WINDSURFAPI_NLU_RETRY=0 to disable globally.
+          const nluRetryEnabled = process.env.WINDSURFAPI_NLU_RETRY !== '0'
+            && (process.env.WINDSURFAPI_NLU_RETRY === '1'
+                || /zhipu|glm|moonshot|kimi/i.test(String(provider || ''))
+                || /^(?:glm|kimi)/i.test(String(modelKey || '')));
           if (toolCalls.length === 0
               && nluRetryEnabled
               && Array.isArray(tools) && tools.length > 0
@@ -3294,7 +3912,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
             const lastUser = latestRealUserText(messages) || '';
             const intendedTool = detectToolIntentInNarrative(narrativeSource, tools, { lastUserText: lastUser });
             if (intendedTool) {
-              nluRetryAttempted = true;
               try {
                 // Build correction history. The cascade backend treats
                 // the assistant turn as a "previous response" the model
@@ -3379,70 +3996,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
             }
           }
         }
-        // Fail safely: NLU retry was attempted but failed. Return adapter_error
-        // so Hermes can fall back rather than silently returning narration as text.
-        if (nluRetryAttempted && toolCalls.length === 0) {
-          log.warn(`Chat[non-stream]: NLU retry attempted but failed — returning adapter_error (model=${modelKey})`);
-          return buildAdapterErrorResponse({
-            code: 'tool_call_required_but_not_emitted',
-            model: modelKey,
-            message: 'Model narrated tool intent but retry-with-correction also failed to produce structured tool_calls.',
-            diagnostic: {
-              provider,
-              requested_tools: tools.map(t => t?.function?.name || t?.name).filter(Boolean),
-              sample: String(narrativeSource || '').slice(0, 240),
-            },
-            retryPrompt: 'Emit a valid structured tool_call using one of the request-declared tools. Do not narrate.',
-          }, 422);
-        }
-        // Blind retry: model produced empty output with tools declared.
-        // Use the user's last message as context so the model knows what to do.
-        if (toolCalls.length === 0
-            && nluRetryEnabled
-            && Array.isArray(tools) && tools.length > 0
-            && !narrativeSource) {
-          const lastUser = latestRealUserText(messages) || '';
-          if (lastUser) {
-            log.info(`Chat[non-stream]: blind retry — model produced empty output, retrying with user prompt (model=${modelKey})`);
-            try {
-              const correctionMessages = [
-                ...cascadeMessages,
-                { role: 'user', content:
-                  `You didn't produce any output. The user asked: "${lastUser.slice(0, 2000)}"\n\n` +
-                  `Use the appropriate tool from the definitions above to handle this request. ` +
-                  `Emit the tool call using the EXACT protocol format. Do NOT narrate. Just the protocol block.\n\n` +
-                  `你没有输出任何内容。用户的问题："${lastUser.slice(0, 500)}"。请使用上面定义的工具，按协议格式 emit tool call，不要 narrate。` },
-              ];
-              const retryChunks = await client.cascadeChat(correctionMessages, modelEnum, modelUid, {
-                reuseEntry: null,
-                toolPreamble: nativeBridgeOn ? '' : toolPreamble,
-                nativeEnvironment: nativeBridgeOn ? (nativeOpts?.environment || '') : '',
-                displayModel: model,
-                nativeMode: nativeBridgeOn,
-                nativeAllowlist: nativeOpts?.allowlist || null,
-                additionalSteps: nativeOpts?.additionalSteps || null,
-              });
-              let retryText = '';
-              for (const c of retryChunks) {
-                if (c.text) retryText += c.text;
-              }
-              const retryParsed = parseToolCallsFromText(retryText, { modelKey, provider, route });
-              const retryCalls = filterToolCallsByAllowlist(retryParsed.toolCalls || [], tools);
-              if (retryCalls.length) {
-                log.info(`Chat[non-stream]: blind retry — promoted ${retryCalls.length} tool_call(s) (model=${modelKey})`);
-                toolCalls = retryCalls;
-                bridgeDiag.emulatedToolCalls += retryCalls.length;
-                bridgeDiag.emulatedNames.push(...retryCalls.map(tc => tc.name));
-                allText = retryParsed.text || '';
-                allThinking = '';
-              } else {
-                log.warn(`Chat[non-stream]: blind retry — still 0 tool_calls after retry (model=${modelKey})`);
-              }
-            } catch (retryErr) {
-              log.warn(`Chat[non-stream]: blind retry failed: ${retryErr.message}`);
-            }
-          }
-        }
       } else {
         allText = stripToolMarkupFromText(allText);
       }
@@ -3457,24 +4010,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       const chunks = await client.rawGetChatMessage(messages, modelEnum, modelUid);
       for (const c of chunks) {
         if (c.text) allText += c.text;
-      }
-    }
-
-    if (emulateTools && Array.isArray(tools) && tools.length > 0 && toolCalls.length === 0) {
-      const narrativeSourceForStrictAdapter = (allText && allText.trim()) ? allText : allThinking;
-      if (looksLikeNarratedToolIntent(narrativeSourceForStrictAdapter)) {
-        log.warn(`Chat[non-stream]: strict adapter_error — model narrated tool intent but emitted no structured tool_call (model=${modelKey})`);
-        return buildAdapterErrorResponse({
-          code: 'tool_call_required_but_not_emitted',
-          model: modelKey,
-          message: 'Model narrated tool intent but emitted no structured tool_call. Refusing to fabricate a tool call from prose.',
-          diagnostic: {
-            provider,
-            requested_tools: tools.map(t => t?.function?.name || t?.name).filter(Boolean),
-            sample: String(narrativeSourceForStrictAdapter || '').slice(0, 240),
-          },
-          retryPrompt: 'Emit a valid structured tool_call using one of the request-declared tools. Do not narrate the action.',
-        }, 422);
       }
     }
 
@@ -3555,7 +4090,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     reportSuccess(apiKey);
     updateCapability(apiKey, modelKey, true, 'success');
     recordRequest(model, true, Date.now() - startTime, apiKey);
-    try { recordUpstreamSend(apiKey, modelKey); } catch {}
 
     // Store in cache for next identical request. Skip caching tool_call
     // responses — they're inherently contextual and the cache doesn't
@@ -3626,6 +4160,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       status: 200,
       body: {
         id, object: 'chat.completion', created, model,
+        system_fingerprint: systemFingerprint(model),
         choices: [{ index: 0, message, finish_reason: finishReason }],
         usage,
       },
@@ -3635,7 +4170,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // errors and transport issues shouldn't disable the key.
     const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
     const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
-    const isInternal = /internal error occurred.*error id/i.test(err.message);
+    const isInternal = /internal error occurred.*(error|trace)\s*id/i.test(err.message);
     const isDeadline = isUpstreamDeadlineExceeded(err);
     const isTransport = isCascadeTransportError(err);
     const isTransient = !isDeadline && isUpstreamTransientError(err, isInternal);
@@ -3647,14 +4182,18 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // moderation" warnings (which can be retried on a different model).
     const isPolicyBlocked = /cyber\s*verification|content[\s_-]+policy|policy[\s_-]+(?:violation|blocked|denied)|safety[\s_-]+(?:policy|blocked)|prompt[\s_-]+(?:rejected|blocked)\s+by[\s_-]+policy|usage[\s_-]+policy[\s_-]+violation/i.test(err.message);
     if (isAuthFail) reportError(apiKey);
-    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); onRateLimitLockout(apiKey, modelKey, rateLimitCooldownMs(err.message)); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
+    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
     if (isInternal) { reportInternalError(apiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
     if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
     if (isPolicyBlocked) { err.isPolicyBlocked = true; err.isModelError = true; err.kind = 'policy_blocked'; }
     // v2.0.56: ban-shaped error → reportBanSignal handles the 2-strike
     // promotion to status='banned'. Skip when also a rate-limit so we
-    // don't conflate "out of quota" with "account dead".
-    if (!isRateLimit && looksLikeBanSignal(err.message)) {
+    // don't conflate "out of quota" with "account dead". Also skip when the
+    // error is internal or otherwise transient: the upstream sometimes wraps a
+    // transient stall in a 401/403 shell whose text matches BAN_PATTERNS
+    // (e.g. "authentication ... failed"), and promoting that to a permanent
+    // ban would burn a healthy account — transient-first must win here.
+    if (!isRateLimit && !isInternal && !isTransient && looksLikeBanSignal(err.message)) {
       reportBanSignal(apiKey, err.message);
       err.isModelError = true; err.kind ||= 'auth_error';
     }
@@ -3662,7 +4201,6 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       updateCapability(apiKey, modelKey, false, 'model_error');
     }
     recordRequest(model, false, Date.now() - startTime, apiKey);
-    try { recordUpstreamSend(apiKey, modelKey); } catch {}
     log.error('Chat error:', err.message);
     // v2.0.61 — policy block surfaces as 451 Unavailable For Legal Reasons,
     // which is exactly the semantic clients need (the model refuses the
@@ -3781,7 +4319,19 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           abortController.abort();
         }
       });
+      const fp = systemFingerprint(model);
+      // O10: 仅直连 OpenAI 客户端(route==='chat')归一化 error.type;
+      // messages/gemini/responses 路由须保留内部词供下游 translator remap。
+      const isOpenAIClient = (fpOpts?.route || 'chat') === 'chat';
       const send = (data) => {
+        // O9: 给每个 chat.completion.chunk 注入合成 system_fingerprint;error /
+        // usage-only 等其它帧不动。幂等 —— 已带值(如 connect 路径预置)则不覆盖。
+        if (data && data.object === 'chat.completion.chunk' && data.system_fingerprint == null) {
+          data.system_fingerprint = fp;
+        }
+        if (isOpenAIClient && data && data.error && typeof data.error.type === 'string') {
+          data.error.type = normalizeOpenAIErrorType(data.error.type);
+        }
         if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
       };
       unregisterSse = registerSseController({
@@ -3823,8 +4373,11 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           }
           send({ id, object: 'chat.completion.chunk', created, model,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-          send({ id, object: 'chat.completion.chunk', created, model,
-            choices: [], usage: cachedUsage(messages, cached.text) });
+          // O1: only the include_usage opt-in gets the trailing usage frame.
+          if (deps.includeUsage) {
+            send({ id, object: 'chat.completion.chunk', created, model,
+              choices: [], usage: cachedUsage(messages, cached.text) });
+          }
           if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
         } finally {
           unregisterSse();
@@ -3941,9 +4494,9 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
       };
-      const emitThinking = (clean) => {
+      const emitThinking = (clean, { accumulate = true } = {}) => {
         if (!clean) return;
-        accThinking += clean;
+        if (accumulate) accThinking += clean;
         emittedClientPayload = true;
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { reasoning_content: clean }, finish_reason: null }] });
@@ -3951,7 +4504,6 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
 
       const emitToolCallDelta = (tc, idx) => {
         emittedClientPayload = true;
-        log.info(`ToolCallDelta[${reqId}]: index=${idx} name=${tc?.name || ''} source=stream`);
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: {
             tool_calls: [{
@@ -4099,7 +4651,18 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
           if (safeText) emitContent(pathStreamText.feed(safeText));
         }
         if (chunk.thinking) {
-          emitThinking(pathStreamThinking.feed(chunk.thinking));
+          const cleanThinking = pathStreamThinking.feed(chunk.thinking);
+          if (emulateTools) {
+            // In tool-emulation mode, high-reasoning models may hide a
+            // <tool_call> block in reasoning_content. Buffer thinking until
+            // stream end so we can either emit a clean tool_use turn OR emit
+            // reasoning, but never stream reasoning first and append tool_use
+            // later in the same assistant turn (Claude Code reports
+            // "Content block not found" on that block-order pattern).
+            if (cleanThinking) accThinking += cleanThinking;
+          } else {
+            emitThinking(cleanThinking);
+          }
         }
       };
 
@@ -4204,7 +4767,6 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 refundReservation(acct.apiKey, acct.reservationTimestamp);
                 if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
                   markRateLimited(acct.apiKey, rl.retryAfterMs, modelKey);
-                  onRateLimitLockout(acct.apiKey, modelKey, rl.retryAfterMs);
                 }
                 if (!reuseEntryDead && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
                   const availability = getAccountAvailability(acct.apiKey, modelKey);
@@ -4297,7 +4859,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               // accThinking for marker / NLU detection so models that
               // route narrate output through reasoning_content (GLM-4.7,
               // some Claude models in thinking mode) don't slip past.
-              const accNarrative = (accText && accText.trim()) ? accText : accThinking;
+              // v2.0.146 fix: always merge both so Opus 4.8 xhigh that
+              // emits <tool_call> inside thinking while producing non-empty
+              // text doesn't lose the markup. The old text-only guard meant
+              // markers=xml_tag was detected from thinking (the marker scan
+              // ran on the combined string) but NLU/parse ran against text
+              // only — missing the actual <tool_call> block entirely.
+              const accNarrative = [accText, accThinking].filter(s => s && s.trim()).join('\n');
               if (emulateTools && collectedToolCalls.length === 0 && accNarrative) {
                 const head = accNarrative.slice(0, 240).replace(/\s+/g, ' ');
                 const markers = [];
@@ -4315,7 +4883,7 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
                 // v2.0.76 (#120 follow-up): widened to fire even when
                 // markers were detected but parser produced 0 calls
                 // (mirrors the non-stream path).
-                if (false && declaredTools.length > 0) {
+                if (declaredTools.length > 0) {
                   const lastUser = latestRealUserText(messages) || '';
                   const recovered = extractIntentFromNarrative(accNarrative, declaredTools, { lastUserText: lastUser, markers });
                   if (recovered.length) {
@@ -4350,7 +4918,58 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
               }
             }
             emitContent(pathStreamText.flush());
-            emitThinking(pathStreamThinking.flush());
+            // v2.0.146 fix: scan accThinking for <tool_call> blocks when
+            // the text-only toolParser produced nothing. Opus 4.8 xhigh
+            // and similar high-reasoning models sometimes emit the full
+            // <tool_call>{...}</tool_call> markup inside thinking
+            // (reasoning_content) rather than in the text stream.
+            //
+            // ORDERING IS CRITICAL: this must run AFTER pathStreamText.flush()
+            // and BEFORE pathStreamThinking.flush(). If it ran before the text
+            // flush, emitToolCallDelta would be followed by emitContent/emitThinking
+            // which produce additional content_block_start events in the
+            // MessagesStreamTranslator — Claude Code then sees a tool_use block
+            // followed by a text or thinking block without proper sequencing and
+            // throws "Content block not found". Running here lets us suppress
+            // the thinking flush (below) when tool_calls were recovered,
+            // keeping the SSE block sequence clean: thinking block is already
+            // closed by pathStreamThinking.flush returning empty string.
+            {
+              const thinkingTail = pathStreamThinking.flush();
+              if (emulateTools) {
+                const bufferedThinking = `${accThinking || ''}${thinkingTail || ''}`;
+                if (collectedToolCalls.length === 0 && bufferedThinking.trim()) {
+                  const parsedFromThinking = parseToolCallsFromText(bufferedThinking, { modelKey, provider, route: deps?.route || 'chat' });
+                  const fromThinking = filterToolCallsByAllowlist(parsedFromThinking.toolCalls, declaredTools);
+                  if (fromThinking.length) {
+                    accThinking = bufferedThinking;
+                    log.info(`Chat[stream]: lifted ${fromThinking.length} tool_call(s) from thinking content (model=${modelKey})`);
+                    // Do NOT emit thinking when it yielded tool_calls. Emitting
+                    // a reasoning_content block before a tail tool_call in the
+                    // same assistant turn produces an invalid Anthropic event
+                    // sequence for Claude Code (block index mismatch →
+                    // "Content block not found").
+                    for (const rawTc of fromThinking) {
+                      const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                      const idx = collectedToolCalls.length;
+                      collectedToolCalls.push(tc);
+                      bridgeDiag.emulatedToolCalls++;
+                      bridgeDiag.emulatedNames.push(tc.name);
+                      emitToolCallDelta(tc, idx);
+                    }
+                  } else {
+                    accThinking = '';
+                    emitThinking(bufferedThinking);
+                  }
+                } else {
+                  // A tool_call was already emitted from text/native parsing;
+                  // keep any buffered reasoning only for accounting/cache state.
+                  accThinking = bufferedThinking;
+                }
+              } else {
+                emitThinking(thinkingTail);
+              }
+            }
 
             // v2.0.65 native bridge: cascade trajectory steps come back on
             // cascadeResult.toolCalls with cascade_native:true. Translate
@@ -4452,7 +5071,6 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (hadSuccess) reportSuccess(currentApiKey);
             updateCapability(currentApiKey, modelKey, true, 'success');
             recordRequest(model, true, Date.now() - startTime, currentApiKey);
-            try { recordUpstreamSend(currentApiKey, modelKey); } catch {}
             if (!rolePrinted) {
               send({ id, object: 'chat.completion.chunk', created, model,
                 choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
@@ -4496,10 +5114,15 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             send({ id, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: {}, finish_reason: finalReason }] });
             {
+              // Always build + record for internal billing; O1: only forward the
+              // usage-only frame to the client when they opted in via
+              // stream_options.include_usage (OpenAI omits it by default).
               const usage = buildUsageBody(cascadeResult?.usage || null, messages, accText, accThinking, cachePolicy);
               try { recordTokenUsage(usage); } catch {}
-              send({ id, object: 'chat.completion.chunk', created, model,
-                choices: [], usage });
+              if (deps.includeUsage) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [], usage });
+              }
             }
             if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
             if (ckey && !collectedToolCalls.length && (accText || accThinking)) {
@@ -4530,13 +5153,13 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             }
             const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
             const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
-            const isInternal = /internal error occurred.*error id/i.test(err.message);
+            const isInternal = /internal error occurred.*(error|trace)\s*id/i.test(err.message);
             const isTransport = isCascadeTransportError(err);
             const isTransient = !isDeadline && isUpstreamTransientError(err, isInternal);
             // v2.0.61 (#113) — same policy detection as nonStreamResponse.
             const isPolicyBlocked = /cyber\s*verification|content[\s_-]+policy|policy[\s_-]+(?:violation|blocked|denied)|safety[\s_-]+(?:policy|blocked)|prompt[\s_-]+(?:rejected|blocked)\s+by[\s_-]+policy|usage[\s_-]+policy[\s_-]+violation/i.test(err.message);
             if (isAuthFail) reportError(currentApiKey);
-            if (isRateLimit) { recordRateLimited(); markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); onRateLimitLockout(currentApiKey, modelKey, rateLimitCooldownMs(err.message)); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
+            if (isRateLimit) { recordRateLimited(); markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
             // v2.0.91 — IP-level rate limit circuit breaker (stream path).
             // Same logic as non-stream: ≥3 accounts rate-limited for the
             // same model within 8s → Windsurf is doing IP-wide cooldown,
@@ -4575,8 +5198,10 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
             if (isPolicyBlocked) { recordPolicyBlocked(); err.isPolicyBlocked = true; err.isModelError = true; err.kind = 'policy_blocked'; }
             if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
             // v2.0.56 stream-path ban detection — same 2-strike logic as
-            // non-stream. See nonStreamResponse for rationale.
-            if (!isRateLimit && looksLikeBanSignal(err.message)) {
+            // non-stream. See nonStreamResponse for rationale, including the
+            // transient-first guard (internal/transient errors wrapped in an
+            // auth-shaped shell must not be promoted to a permanent ban).
+            if (!isRateLimit && !isInternal && !isTransient && looksLikeBanSignal(err.message)) {
               reportBanSignal(currentApiKey, err.message);
               err.isModelError = true; err.kind ||= 'auth_error';
             }
@@ -4629,7 +5254,6 @@ function streamResponse(id, created, model, modelKey, provider, messages, cascad
         // All attempts failed
         log.error('Stream error after retries:', lastErr?.message || String(lastErr || 'account queue timed out without an error object'));
         recordRequest(model, false, Date.now() - startTime, currentApiKey);
-        try { recordUpstreamSend(currentApiKey, modelKey); } catch {}
         try {
           const temporaryUnavailable = isAllTemporarilyUnavailable(modelKey);
           const rl = isAllRateLimited(modelKey);
