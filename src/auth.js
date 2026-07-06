@@ -238,6 +238,64 @@ export function getDroughtSummary() {
   };
 }
 
+// ─── Rolling health window (ported verbatim from upstream auth.js) ─────
+// Phase 1 of the upstream merge ports only the ACCESSORS (dashboard/api.js
+// imports getPoolHealthWindow at module load). The recordHealthEvent call
+// sites live in upstream's rewritten pool functions — they arrive in Phase 2,
+// so summaries report zero counts until then.
+const HEALTH_WINDOW_MS = 60 * 60 * 1000;   // 1h rolling window
+const HEALTH_MAX_EVENTS = 240;             // hard cap so a hot account can't bloat the file
+// Event kinds kept short to minimize persisted size: o=ok e=error t=throttle c=capacity d=dead-token
+const HEALTH_KINDS = new Set(['o', 'e', 't', 'c', 'd']);
+
+function pruneHealthWindow(account, now) {
+  if (!Array.isArray(account._health)) account._health = [];
+  const cutoff = now - HEALTH_WINDOW_MS;
+  // Events are appended in time order, so drop from the front until in-window.
+  let drop = 0;
+  while (drop < account._health.length && account._health[drop].t < cutoff) drop++;
+  if (drop) account._health.splice(0, drop);
+  // Defensive cap (e.g. clock skew or a burst): keep the most recent N.
+  if (account._health.length > HEALTH_MAX_EVENTS) {
+    account._health.splice(0, account._health.length - HEALTH_MAX_EVENTS);
+  }
+  return account._health;
+}
+
+// Record one outcome for an account. Persisted lazily (callers already save on
+// status flips; the window itself is best-effort and rides the next save).
+function recordHealthEvent(account, kind, now = Date.now()) {
+  if (!account || !HEALTH_KINDS.has(kind)) return;
+  pruneHealthWindow(account, now);
+  account._health.push({ t: now, k: kind });
+}
+
+/** Summarize an account's last-hour health for metrics/selection (no secrets). */
+function healthSummary(account, now = Date.now()) {
+  const win = pruneHealthWindow(account, now);
+  const out = { ok: 0, error: 0, throttle: 0, capacity: 0, dead: 0, total: win.length };
+  const map = { o: 'ok', e: 'error', t: 'throttle', c: 'capacity', d: 'dead' };
+  for (const ev of win) { const name = map[ev.k]; if (name) out[name]++; }
+  return out;
+}
+
+/** Public accessor: rolling-hour health for one account by apiKey. */
+export function getAccountHealth(apiKey, now = Date.now()) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  return account ? healthSummary(account, now) : null;
+}
+
+/** Public accessor: rolling-hour health across the whole pool (triage/metrics). */
+export function getPoolHealthWindow(now = Date.now()) {
+  return accounts.map(a => ({
+    id: a.id,
+    email: a.email,
+    status: a.status,
+    tier: a.tier,
+    health: healthSummary(a, now),
+  }));
+}
+
 function pruneRpmHistory(account, now) {
   if (!account._rpmHistory) account._rpmHistory = [];
   const cutoff = now - RPM_WINDOW_MS;

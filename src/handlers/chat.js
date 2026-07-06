@@ -435,6 +435,93 @@ export function chatStreamError(message, type = 'upstream_error', code = null) {
   return { error: { message: sanitizeText(message || 'Upstream stream error'), type, code } };
 }
 
+// ─── OpenAI error vocabulary + connect error mapping ─────────────────
+// Ported verbatim from upstream chat.js (Phase 1 of the upstream merge):
+// gemini.js / messages.js / responses.js / server.js import these at module
+// load. The devin-connect dispatch that FEEDS connectErrorToHttp arrives in
+// Phase 2 — until then it only serves the error-shaping call sites.
+
+/**
+ * Map a DEVIN_CONNECT classified error code (from devin-connect.js
+ * classifyUpstreamError) to the OpenAI-shaped HTTP status + error type. A
+ * free-tier account hitting a paid selector returns MODEL_BLOCKED, which must
+ * read as 402 (payment/entitlement) rather than a generic 502.
+ */
+export function connectErrorToHttp(code) {
+  switch (code) {
+    case 'MODEL_BLOCKED': return { status: 402, type: 'model_blocked' };
+    case 'QUOTA_EXHAUSTED': return { status: 402, type: 'insufficient_quota' };
+    case 'UNAUTHORIZED': return { status: 401, type: 'authentication_error' };
+    case 'RATE_LIMITED': return { status: 429, type: 'rate_limit_error' };
+    case 'CAPACITY': return { status: 503, type: 'capacity_error' };
+    case 'UPSTREAM_INTERNAL': return { status: 503, type: 'upstream_transient_error' };
+    case 'NO_TOKEN': return { status: 401, type: 'authentication_error' };
+    case 'TIMEOUT': return { status: 504, type: 'timeout_error' };
+    default: return { status: 502, type: 'upstream_error' };
+  }
+}
+
+// O10: official OpenAI error `type` vocabulary. Anything outside this set that
+// reaches an OpenAI-family client (/v1/chat/completions, /v1/responses) is
+// normalized to the closest official value at the egress boundary. The INTERNAL
+// vocabulary (rate_limit_exceeded, upstream_transient_error, ...) is left intact
+// everywhere it doubles as classification input for the retry loop,
+// shouldAutoFallback, toAnthropicError (messages.js) and geminiError (gemini.js).
+export const OFFICIAL_OPENAI_ERROR_TYPES = new Set([
+  'invalid_request_error', 'authentication_error', 'permission_error',
+  'not_found_error', 'rate_limit_error', 'insufficient_quota',
+  'api_error', 'server_error',
+]);
+
+const INTERNAL_TO_OPENAI_TYPE = {
+  invalid_request: 'invalid_request_error',
+  auth_error: 'api_error',
+  not_found: 'not_found_error',
+  rate_limit_exceeded: 'rate_limit_error',
+  pool_exhausted: 'api_error',
+  ls_pool_exhausted: 'api_error',
+  ls_unavailable: 'api_error',
+  upstream_error: 'api_error',
+  upstream_transient_error: 'api_error',
+  upstream_internal_error: 'api_error',
+  upstream_deadline_exceeded: 'api_error',
+  timeout_error: 'api_error',
+  capacity_error: 'api_error',
+  model_blocked: 'permission_error',
+  model_not_available: 'api_error',
+  payload_too_large: 'invalid_request_error',
+  unsupported_media: 'invalid_request_error',
+  unsupported_tool_boundary: 'invalid_request_error',
+  fabricated_tool_result: 'api_error',
+  policy_blocked: 'invalid_request_error',
+  backend_error: 'api_error',
+  backend_unavailable: 'api_error',
+  backend_pool_exhausted: 'api_error',
+};
+
+export function normalizeOpenAIErrorType(type, status) {
+  if (typeof type === 'string' && OFFICIAL_OPENAI_ERROR_TYPES.has(type)) return type;
+  if (type && Object.prototype.hasOwnProperty.call(INTERNAL_TO_OPENAI_TYPE, type)) {
+    return INTERNAL_TO_OPENAI_TYPE[type];
+  }
+  const s = Number(status) || 500;
+  if (s === 401) return 'authentication_error';
+  if (s === 403) return 'permission_error';
+  if (s === 404) return 'not_found_error';
+  if (s === 429) return 'rate_limit_error';
+  if (s >= 500) return 'api_error';
+  return 'invalid_request_error';
+}
+
+// Mutate-in-place the error type of an OpenAI-shaped {error:{type}} body. No-op
+// on success bodies (no .error) and on already-official types.
+export function normalizeOpenAIErrorBody(body, status) {
+  if (body && body.error && typeof body.error === 'object' && 'type' in body.error) {
+    body.error.type = normalizeOpenAIErrorType(body.error.type, status);
+  }
+  return body;
+}
+
 export function finishPartialStreamAfterError({ id, created, model, send, res }) {
   if (typeof send === 'function') {
     send({
