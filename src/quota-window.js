@@ -81,9 +81,22 @@ const MIN_LEARN_COUNT = 10;
 /** Keep the last N learned caps; capEstimate = min(learnedCaps). */
 const LEARNED_CAP_RING = 5;
 
+/** Rolling window for the per-minute RATE guard. The upstream limit may be
+ * enforced as a rate (a burst past ~60/min triggers a 1-3h lockout), which the
+ * cumulative window budget cannot catch — a subagent fan-out can leap from
+ * "safe" to "locked" between two budget checks. This guard throttles when
+ * proxy-visible sends approach the per-minute cap. NOTE: the proxy sees only
+ * obie's share of the account; the devin CLI's direct sends are invisible, so
+ * this cannot prevent a CLI-driven breach — set the cap with headroom. */
+const RATE_WINDOW_MS = 60 * 1000;
+
 // windows: { "<acctPrefix>": { accountId, windowStart, windowEnd, count,
 //            byModel: {model: n}, learnedCaps: [], lockouts, _milestones: {} } }
 let _windows = Object.create(null);
+
+// Interval-pacer scheduler (Option A): per account, the earliest time the next
+// send may fire. Each caller claims the next slot and advances it by 60000/RPM.
+let _nextSlot = Object.create(null);
 
 // Load persisted state (best-effort, shape-checked).
 try {
@@ -117,6 +130,57 @@ function accountCapDefault(env = process.env) {
   return Number.isFinite(n) && n > 0 ? n : ACCOUNT_CAP_DEFAULT;
 }
 
+/** Per-minute send cap for the rate guard / pacer. 0 (unset) disables it. */
+function ratePerMin(env = process.env) {
+  const n = parseInt(env.WINDSURFAPI_QUOTA_RATE_PER_MIN || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/** The interval pacer (Option A) smooths sends to <= RATE_PER_MIN by making
+ * callers WAIT for their slot instead of 429ing — a single account then serves
+ * obie's fan-out without tripping the burst lockout. Default OFF (byte-identical
+ * passthrough), independent of the volume governor. */
+function pacerEnabled(env = process.env) {
+  return String(env.WINDSURFAPI_QUOTA_PACER || '').trim() === '1';
+}
+
+/** Beyond this queued wait the pacer rejects instead of holding the request, so
+ * a pathologically deep queue falls back (429) rather than blowing the caller's
+ * timeout. Default 120s — well under obie's 600s child timeout. */
+function pacerMaxWaitMs(env = process.env) {
+  const n = parseInt(env.WINDSURFAPI_QUOTA_PACER_MAX_WAIT_MS || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 120_000;
+}
+
+/**
+ * Substrings that mark a model as STANDARD (low-priority): it is refused at the
+ * WINDSURFAPI_QUOTA_SOFT_PCT threshold. Everything else is PRIORITY and may use
+ * the shared account budget all the way to the hard learned cap. Default covers
+ * obie's cheap workhorse lanes — glm-5* (primary), kimi* (fallback), swe* — so
+ * that a flood of those does not preemptively starve the higher-value models
+ * (gpt-5.5, claude, ...) out of the soft→hard tail the account still has.
+ *
+ * This is NOT a separate quota: the message-rate limit is one account-wide
+ * bucket (proven across 37 lockout episodes — all models unlocked together), so
+ * priority only reallocates the soft→hard band; it never raises the real cap.
+ */
+const DEFAULT_STANDARD_MODELS = ['glm-5', 'kimi', 'swe'];
+
+function standardModelMarkers(env = process.env) {
+  const raw = String(env.WINDSURFAPI_QUOTA_STANDARD_MODELS || '').trim();
+  if (!raw) return DEFAULT_STANDARD_MODELS;
+  return raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+
+/** A model is PRIORITY unless its key matches a standard marker. An unknown or
+ * undefined model is treated as standard — the stricter, safer default, which
+ * also keeps every existing model-agnostic caller on the soft cap. */
+function isPriorityModel(modelKey, env = process.env) {
+  if (!modelKey) return false;
+  const key = String(modelKey).toLowerCase();
+  return !standardModelMarkers(env).some(m => key.includes(m));
+}
+
 /** Same short-prefix convention dashboard/stats.js uses for account keys —
  * never persist a full api key. */
 function acctPrefix(accountId) {
@@ -130,6 +194,7 @@ function freshWindow(accountId, now) {
     windowEnd: now + windowMs(),
     count: 0,
     byModel: Object.create(null),
+    recentSends: [],
     learnedCaps: [],
     lockouts: 0,
     _milestones: {},
@@ -162,6 +227,9 @@ export function recordUpstreamSend(accountId, modelKey, now = Date.now()) {
   w = rollIfExpired(w, accountId, now);
   w.count++;
   if (modelKey) w.byModel[modelKey] = (w.byModel[modelKey] || 0) + 1;
+  // Rolling per-minute send log for the rate guard (prune then append).
+  w.recentSends = (w.recentSends || []).filter(t => t > now - RATE_WINDOW_MS);
+  w.recentSends.push(now);
   _windows[k] = w;
 
   // Log once per window when account usage crosses 50/80/100% of the cap so
@@ -204,29 +272,64 @@ export function onRateLimitLockout(accountId, modelKey, retryAfterMs, now = Date
 
 /**
  * Should upstream sends be refused locally right now because the account pool
- * is near its 1h message cap? Model-agnostic — the limit is account-wide.
+ * is near its message cap? The limit is account-wide (one shared bucket), but
+ * the BUDGET threshold is priority-aware: standard models (glm-5*, kimi*, swe*)
+ * are refused at the soft percent, while priority models keep going to the hard
+ * learned cap — reserving the conservative soft→hard tail for higher-value
+ * traffic. The RATE guard stays model-agnostic: a burst is dangerous regardless
+ * of which model sends it. Pass the requested modelKey to opt into the priority
+ * split; omit it and every model is treated as standard (back-compat).
  *
  * Approximation for a multi-account pool: limited iff EVERY tracked live
- * account window is at or over the soft threshold. With a single-account pool
+ * account window is at or over the threshold. With a single-account pool
  * (the current deployment) this is exact. An account that has never sent has
  * no window and keeps the pool open.
  *
- * @returns {{limited: boolean, retryAfterMs?: number}}
+ * @returns {{limited: boolean, retryAfterMs?: number, reason?: string}}
  */
-export function shouldSoftLimitAccount(now = Date.now(), env = process.env) {
+export function shouldSoftLimitAccount(now = Date.now(), env = process.env, modelKey) {
   if (!governorEnabled(env)) return { limited: false };
   const pct = softPct(env);
+  const rateCap = ratePerMin(env);
+  const priority = isPriorityModel(modelKey, env);
   let sawLive = false;
-  let latestEnd = 0;
+  let budgetEnd = 0;   // latest window end among budget-exhausted accounts
+  let rateRetry = 0;   // shortest rate-drain among rate-breached accounts
   for (const w of Object.values(_windows)) {
     if (now > w.windowEnd) continue; // expired → fresh budget on next send
     sawLive = true;
+
+    // RATE guard (rolling 60s): a burst throttles with a SHORT retry (until the
+    // window drains), independent of the cumulative window budget.
+    let rateBreached = false;
+    if (rateCap > 0) {
+      const recent = (w.recentSends || []).filter(t => t > now - RATE_WINDOW_MS);
+      if (recent.length >= rateCap) {
+        rateBreached = true;
+        const drain = Math.min(...recent) + RATE_WINDOW_MS - now;
+        rateRetry = rateRetry ? Math.min(rateRetry, drain) : drain;
+      }
+    }
+
     const cap = capFor(w, env);
-    if (w.count < Math.ceil((cap * pct) / 100)) return { limited: false };
-    latestEnd = Math.max(latestEnd, w.windowEnd);
+    // Priority models get the whole account budget (refused only at the hard
+    // cap); standard models refuse at the soft percent, ceding the tail.
+    const budgetThreshold = priority ? cap : Math.ceil((cap * pct) / 100);
+    const budgetExhausted = w.count >= budgetThreshold;
+
+    // This account can take the send only if it is under BOTH guards.
+    if (!rateBreached && !budgetExhausted) return { limited: false };
+    if (budgetExhausted) budgetEnd = Math.max(budgetEnd, w.windowEnd);
   }
   if (!sawLive) return { limited: false };
-  return { limited: true, retryAfterMs: Math.max(1000, latestEnd - now) };
+
+  // No account is available. Return the SHORT rate-drain retry when the block
+  // is (also) a rate breach; otherwise the longer budget-window retry.
+  if (rateRetry > 0) {
+    const retry = budgetEnd > now ? Math.min(rateRetry, budgetEnd - now) : rateRetry;
+    return { limited: true, retryAfterMs: Math.max(1000, retry), reason: 'rate' };
+  }
+  return { limited: true, retryAfterMs: Math.max(1000, budgetEnd - now), reason: 'budget' };
 }
 
 /** Per-account snapshot for the dashboard (/quota-windows) and logs. */
@@ -236,6 +339,7 @@ export function getQuotaWindowSummary(now = Date.now()) {
     return {
       accountId: w.accountId,
       count: w.count,
+      sendsLastMin: (w.recentSends || []).filter(t => t > now - RATE_WINDOW_MS).length,
       byModel: { ...w.byModel },
       capEstimate: cap,
       capSource: w.learnedCaps.length ? 'learned' : 'default',
@@ -252,7 +356,42 @@ export function getQuotaWindowSummary(now = Date.now()) {
 }
 
 /** Test hook: reset in-memory state (persistence untouched until next save). */
+const _defaultSleep = (ms) => new Promise(resolve => {
+  const t = setTimeout(resolve, ms);
+  if (t.unref) t.unref();
+});
+
+/**
+ * Interval pacer (Option A). Await this before an upstream send: it holds the
+ * request until its scheduled slot (>= 60000/RPM after the previous send on the
+ * same account), smoothing bursts to <= RATE_PER_MIN so a single account never
+ * trips the burst lockout. The slot claim is SYNCHRONOUS (no await before
+ * _nextSlot is advanced), so concurrent callers get distinct sequential slots
+ * with no thundering herd. Returns { waitedMs } once the slot is due, or
+ * { rejected, retryAfterMs } if the wait would exceed the max — the caller then
+ * 429s and lets the agent fall back. No-op ({ waitedMs: 0 }) unless
+ * WINDSURFAPI_QUOTA_PACER=1 and a positive RATE_PER_MIN are set. `now`/`sleep`
+ * are injectable for deterministic tests.
+ */
+export async function awaitSendSlot(accountId, { now = Date.now(), env = process.env, sleep = _defaultSleep } = {}) {
+  if (!pacerEnabled(env)) return { waitedMs: 0 };
+  const rpm = ratePerMin(env);
+  if (rpm <= 0) return { waitedMs: 0 };
+  const k = acctPrefix(accountId);
+  const intervalMs = Math.ceil(RATE_WINDOW_MS / rpm);
+  const slot = Math.max(now, _nextSlot[k] || 0);
+  const wait = slot - now;
+  if (wait > pacerMaxWaitMs(env)) {
+    // Do NOT claim the slot — a rejected send must not advance the scheduler.
+    return { rejected: true, retryAfterMs: wait };
+  }
+  _nextSlot[k] = slot + intervalMs;
+  if (wait > 0) await sleep(wait);
+  return { waitedMs: wait };
+}
+
 export function _resetForTests() {
   _windows = Object.create(null);
+  _nextSlot = Object.create(null);
   clearTimeout(_saveTimer);
 }

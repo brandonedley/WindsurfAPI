@@ -18,6 +18,7 @@ import {
   onRateLimitLockout,
   shouldSoftLimitAccount,
   getQuotaWindowSummary,
+  awaitSendSlot,
   _resetForTests,
 } from '../src/quota-window.js';
 import { handleChatCompletions } from '../src/handlers/chat.js';
@@ -33,6 +34,8 @@ beforeEach(() => {
   delete process.env.WINDSURFAPI_QUOTA_SOFT_PCT;
   delete process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP;
   delete process.env.WINDSURFAPI_QUOTA_WINDOW_HOURS;
+  delete process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN;
+  delete process.env.WINDSURFAPI_QUOTA_STANDARD_MODELS;
 });
 
 const acctWindow = () => getQuotaWindowSummary().find(w => w.accountId === ACCT.slice(0, 8));
@@ -249,4 +252,197 @@ test('flag off → gate is inert and the native transport runs', async () => {
     if (prevTools !== undefined) process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS = prevTools;
     else delete process.env.WINDSURFAPI_GETCHATMESSAGE_TOOLS;
   }
+});
+
+// ─── per-minute RATE guard (rolling 60s) ────────────────────────
+// The account limit may be enforced as a per-minute RATE (breaching ~60/min
+// triggers a 1-3h lockout), not only as a cumulative window budget. A burst
+// (e.g. subagent fan-out) can leap from "safe" to "locked" between two window
+// checks. This guard throttles when sends approach the per-minute cap, with a
+// SHORT retry (until the rolling window drains), distinct from the long
+// window-budget retry. Opt-in via WINDSURFAPI_QUOTA_RATE_PER_MIN.
+
+test('rate guard trips when sends exceed the per-minute cap within a rolling 60s', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '5';
+  // 5 sends within 4s — nowhere near the cumulative budget, but at the rate cap
+  for (let i = 0; i < 5; i++) recordUpstreamSend(ACCT, GLM, T0 + i * 1000);
+  const res = shouldSoftLimitAccount(T0 + 4000);
+  assert.equal(res.limited, true, 'rate cap reached → limited');
+  assert.ok(res.retryAfterMs > 0 && res.retryAfterMs <= 60_000,
+    `rate-breach retry must be SHORT (<=60s), got ${res.retryAfterMs}`);
+});
+
+test('rate guard does NOT trip when sends stay below the per-minute cap', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '5';
+  // one old send that ages out, then 4 within the last minute (< cap of 5)
+  recordUpstreamSend(ACCT, GLM, T0);
+  for (let i = 0; i < 4; i++) recordUpstreamSend(ACCT, GLM, T0 + 61_000 + i * 1000);
+  const res = shouldSoftLimitAccount(T0 + 65_000);
+  assert.equal(res.limited, false, '4 in the last minute is under the cap of 5');
+});
+
+test('rate guard is inert when WINDSURFAPI_QUOTA_RATE_PER_MIN is unset', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  // 50 sends in 1s, but no rate cap configured and cumulative under budget
+  for (let i = 0; i < 50; i++) recordUpstreamSend(ACCT, GLM, T0 + i * 20);
+  assert.equal(shouldSoftLimitAccount(T0 + 1000).limited, false,
+    'no rate cap set → rate guard must not fire');
+});
+
+test('the gate tags WHY it limited (rate vs budget) for observability', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '5';
+  for (let i = 0; i < 5; i++) recordUpstreamSend(ACCT, GLM, T0 + i * 500);
+  assert.equal(shouldSoftLimitAccount(T0 + 2500).reason, 'rate', 'burst → reason=rate');
+
+  _resetForTests();
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  delete process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN; // isolate the budget path
+  const threshold = Math.ceil(ACCOUNT_CAP_DEFAULT * 0.85);
+  for (let i = 0; i < threshold; i++) recordUpstreamSend(ACCT, GLM, T0 + i * 2000);
+  assert.equal(shouldSoftLimitAccount(T0 + threshold * 2000).reason, 'budget', 'cumulative → reason=budget');
+});
+
+test('the summary exposes sendsLastMin (rolling 60s rate) for the dashboard', () => {
+  recordUpstreamSend(ACCT, GLM, T0);
+  recordUpstreamSend(ACCT, GLM, T0 + 70_000);      // ages out of the 60s window at T0+70s check
+  recordUpstreamSend(ACCT, GLM, T0 + 71_000);
+  const w = getQuotaWindowSummary(T0 + 71_000).find(x => x.accountId === ACCT.slice(0, 8));
+  assert.equal(w.sendsLastMin, 2, 'only the two sends within the last 60s count');
+});
+
+// ─── priority-aware soft limit (reserve the soft→hard tail for pro models) ───
+// The soft cap is preemptive — 85% of a *learned* cap, held conservative for the
+// invisible devin-CLI burn. When the cheap workhorse lanes (glm-5*, kimi*, swe*)
+// burn a window's budget, a blanket refusal starves higher-value models out of
+// headroom the account still has. Priority (non-standard) models are refused only
+// at the HARD learned cap; standard models keep the soft cap. Both still hard-stop
+// at the real cap — priority reallocates the soft→hard band, never raises the
+// ceiling. modelKey is the 3rd arg to shouldSoftLimitAccount(now, env, modelKey).
+
+const GPT = 'gpt-5.5-low';
+
+test('a priority (non-standard) model runs to the HARD cap while standard models soft-limit', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP = '20'; // soft=ceil(20*0.85)=17, hard=20
+  for (let i = 0; i < 17; i++) recordUpstreamSend(ACCT, GLM, T0 + i); // all cheap glm
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, GLM).limited, true,
+    'standard glm soft-limits at 85%');
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, GPT).limited, false,
+    'priority model keeps the 17→20 tail');
+});
+
+test('a priority model IS refused once the account reaches the hard cap', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP = '20';
+  for (let i = 0; i < 20; i++) recordUpstreamSend(ACCT, GLM, T0 + i); // at the hard cap
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, GPT).limited, true,
+    'priority stops at the real account cap — cannot cheat the shared bucket');
+});
+
+test('kimi and swe models are treated as STANDARD (soft-capped), not priority', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP = '20';
+  for (let i = 0; i < 17; i++) recordUpstreamSend(ACCT, GLM, T0 + i);
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, KIMI).limited, true,
+    'kimi is a cheap workhorse lane → soft-capped');
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, 'swe-1').limited, true,
+    'swe models → soft-capped');
+});
+
+test('WINDSURFAPI_QUOTA_STANDARD_MODELS overrides which models are soft-capped', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP = '20';
+  process.env.WINDSURFAPI_QUOTA_STANDARD_MODELS = 'gpt-5.5'; // gpt becomes the cheap lane
+  for (let i = 0; i < 17; i++) recordUpstreamSend(ACCT, GLM, T0 + i);
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, GLM).limited, false,
+    'glm not in override list → priority → gets the tail');
+  assert.equal(shouldSoftLimitAccount(T0 + 100, process.env, GPT).limited, true,
+    'gpt-5.5 now standard → soft-capped');
+});
+
+test('an unknown/undefined model defaults to STANDARD (stricter, safer — back-compat)', () => {
+  process.env.WINDSURFAPI_QUOTA_GOVERNOR = '1';
+  process.env.WINDSURFAPI_QUOTA_ACCOUNT_CAP = '20';
+  for (let i = 0; i < 17; i++) recordUpstreamSend(ACCT, GLM, T0 + i);
+  assert.equal(shouldSoftLimitAccount(T0 + 100).limited, true,
+    'no model arg → standard → soft-limited (existing callers unchanged)');
+});
+
+// ─── interval pacer (Option A: WAIT, don't reject) ──────────────
+// Single-account fix: obie's subagent fan-out bursts one Windsurf account past
+// the docs' RPM<10. The pacer QUEUES sends ~7.5s apart (at RPM=8) instead of
+// 429ing, so the account never trips the burst lockout. GetUserStatus proved the
+// account is rate-limited, not volume-limited (weekly 99%), so smoothing the
+// rate is lossless. Flag: WINDSURFAPI_QUOTA_PACER=1 (default OFF).
+
+const PACE = 'devin-tok-pace';
+// A fake sleep that records requested durations instead of actually waiting.
+function fakeSleeper() {
+  const calls = [];
+  return { sleep: async (ms) => { calls.push(ms); }, calls };
+}
+
+test('pacer OFF by default → no wait, byte-identical passthrough', async () => {
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '8';
+  const { sleep, calls } = fakeSleeper();
+  const r = await awaitSendSlot(PACE, { now: T0, sleep });
+  assert.deepEqual(r, { waitedMs: 0 });
+  assert.equal(calls.length, 0, 'never sleeps when pacer disabled');
+});
+
+test('pacer ON but no RPM set → no wait', async () => {
+  process.env.WINDSURFAPI_QUOTA_PACER = '1';
+  const { sleep } = fakeSleeper();
+  const r = await awaitSendSlot(PACE, { now: T0, sleep });
+  assert.equal(r.waitedMs, 0);
+});
+
+test('pacer spaces sends by 60000/RPM (7500ms at RPM=8)', async () => {
+  process.env.WINDSURFAPI_QUOTA_PACER = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '8';
+  const { sleep, calls } = fakeSleeper();
+  const r1 = await awaitSendSlot(PACE, { now: T0, sleep });
+  const r2 = await awaitSendSlot(PACE, { now: T0, sleep });
+  const r3 = await awaitSendSlot(PACE, { now: T0, sleep });
+  assert.equal(r1.waitedMs, 0, 'first send fires immediately');
+  assert.equal(r2.waitedMs, 7500, 'second waits one interval');
+  assert.equal(r3.waitedMs, 15000, 'third waits two intervals');
+  assert.deepEqual(calls, [7500, 15000], 'only actually sleeps on waits > 0');
+});
+
+test('pacer advances from now when the schedule has gone stale', async () => {
+  process.env.WINDSURFAPI_QUOTA_PACER = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '8';
+  const { sleep } = fakeSleeper();
+  await awaitSendSlot(PACE, { now: T0, sleep });               // claims T0, next=T0+7500
+  const late = await awaitSendSlot(PACE, { now: T0 + 60_000, sleep }); // well past the slot
+  assert.equal(late.waitedMs, 0, 'a request after the slot has passed does not wait');
+});
+
+test('pacer isolates accounts', async () => {
+  process.env.WINDSURFAPI_QUOTA_PACER = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '8';
+  const { sleep } = fakeSleeper();
+  await awaitSendSlot('acct-A', { now: T0, sleep });
+  const b = await awaitSendSlot('acct-B', { now: T0, sleep });
+  assert.equal(b.waitedMs, 0, 'a different account has its own schedule');
+});
+
+test('pacer rejects when the queue is deeper than max wait (429 fallback)', async () => {
+  process.env.WINDSURFAPI_QUOTA_PACER = '1';
+  process.env.WINDSURFAPI_QUOTA_RATE_PER_MIN = '8';               // 7500ms interval
+  process.env.WINDSURFAPI_QUOTA_PACER_MAX_WAIT_MS = '10000';
+  const { sleep } = fakeSleeper();
+  await awaitSendSlot(PACE, { now: T0, sleep });                  // wait 0,    next 7500
+  const r2 = await awaitSendSlot(PACE, { now: T0, sleep });       // wait 7500 (<10000) ok
+  const r3 = await awaitSendSlot(PACE, { now: T0, sleep });       // wait 15000 (>10000) reject
+  assert.equal(r2.waitedMs, 7500);
+  assert.equal(r3.rejected, true, 'beyond max wait → reject so caller can 429/fallback');
+  assert.equal(r3.retryAfterMs, 15000);
+  const r4 = await awaitSendSlot(PACE, { now: T0, sleep });       // still 15000 — reject did not claim a slot
+  assert.equal(r4.rejected, true, 'a rejected send must not advance the scheduler');
+  assert.equal(r4.retryAfterMs, 15000);
 });

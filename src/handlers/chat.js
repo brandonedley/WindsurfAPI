@@ -13,7 +13,7 @@ import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
 import { safeAccountRef, safeKeyRef } from '../log-safety.js';
 import { recordRequest, recordTokenUsage, recordPolicyBlocked, recordRateLimited } from '../dashboard/stats.js';
-import { recordUpstreamSend, onRateLimitLockout, shouldSoftLimitAccount } from '../quota-window.js';
+import { recordUpstreamSend, onRateLimitLockout, shouldSoftLimitAccount, awaitSendSlot } from '../quota-window.js';
 import { extractIntentFromNarrative, detectToolIntentInNarrative } from './intent-extractor.js';
 import { markRequest as markQuietWindowRequest } from '../dashboard/quiet-window-updater.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
@@ -1855,10 +1855,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
       // messages and taking the multi-hour upstream lockout. Same 429 shape as
       // the cooldown returns below — agent clients follow Retry-After into
       // their fallback provider.
-      const softLimit = shouldSoftLimitAccount();
+      const softLimit = shouldSoftLimitAccount(Date.now(), process.env, nativeRouteModelKey);
       if (softLimit.limited) {
         const retryAfterSec = Math.max(1, Math.ceil(softLimit.retryAfterMs / 1000));
-        log.warn(`Chat[${reqId}]: quota governor — account near 1h message cap, refusing ${nativeRouteModelKey} locally (retry ${retryAfterSec}s)`);
+        log.warn(`Chat[${reqId}]: quota governor [${softLimit.reason}] — account near message cap, refusing ${nativeRouteModelKey} locally (retry ${retryAfterSec}s)`);
         return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${reqModel} 已接近本窗口消息配额（quota governor），请 ${retryAfterSec} 秒后重试或换用其他模型`, type: 'rate_limit_exceeded', retry_after_ms: softLimit.retryAfterMs } } };
       }
       const transport = context.__nativeToolsTransport || getChatMessageWithTools;
@@ -1888,6 +1888,19 @@ async function _handleChatCompletionsInner(body, context = {}) {
         nativeAcct = await waitForAccountFn(triedNative, context.signal, undefined, nativeRouteModelKey, callerKey);
       }
       if (nativeAcct) {
+        // Interval pacer (Option A): hold the request to <= RATE_PER_MIN so this
+        // single account never bursts into the upstream lockout (GetUserStatus
+        // proved it is rate-limited, not volume-limited — smoothing is lossless).
+        // Waits for the slot; only 429s if the queue is pathologically deep, so a
+        // pace never blows the caller's timeout. No-op unless WINDSURFAPI_QUOTA_PACER=1.
+        const pace = await awaitSendSlot(nativeAcct.apiKey);
+        if (pace.rejected) {
+          const retryAfterSec = Math.max(1, Math.ceil(pace.retryAfterMs / 1000));
+          log.info(`Chat[${reqId}]: native route — pacer queue full for ${nativeRouteModelKey}, 429 (retry ${retryAfterSec}s)`);
+          return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${reqModel} 请求速率过高（pacer），请 ${retryAfterSec} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: pace.retryAfterMs } } };
+        } else if (pace.waitedMs > 0) {
+          log.info(`Chat[${reqId}]: pacer held ${nativeRouteModelKey} ${pace.waitedMs}ms to stay under rate cap`);
+        }
         // Dashboard stats parity with the legacy paths: the native route
         // carries the bulk of agent traffic (agents always send tools[]), so
         // it must feed recordRequest/recordTokenUsage or stats.json blindly
@@ -2457,10 +2470,10 @@ async function _handleChatCompletionsInner(body, context = {}) {
   // Quota governor (flag-gated): same local-refusal pattern as drought mode,
   // but for the per-model MESSAGE window instead of the weekly credit quota.
   {
-    const softLimit = shouldSoftLimitAccount();
+    const softLimit = shouldSoftLimitAccount(Date.now(), process.env, routingModelKey);
     if (softLimit.limited) {
       const retryAfterSec = Math.max(1, Math.ceil(softLimit.retryAfterMs / 1000));
-      log.warn(`Chat[${reqId}]: quota governor — account near 1h message cap, refusing ${routingModelKey} locally (retry ${retryAfterSec}s)`);
+      log.warn(`Chat[${reqId}]: quota governor [${softLimit.reason}] — account near message cap, refusing ${routingModelKey} locally (retry ${retryAfterSec}s)`);
       return { status: 429, headers: { 'Retry-After': String(retryAfterSec) }, body: { error: { message: `${displayModel} 已接近本窗口消息配额（quota governor），请 ${retryAfterSec} 秒后重试或换用其他模型`, type: 'rate_limit_exceeded', retry_after_ms: softLimit.retryAfterMs } } };
     }
   }
