@@ -226,12 +226,13 @@ describe('GET /quota-windows (quota governor)', () => {
     config.dashboardPassword = '';
     config.apiKey = '';
     configureBindHost('127.0.0.1');
+    process.env.DASHBOARD_ALLOW_NO_AUTH = '1'; // convenience: exercise the summary, not auth (fail-closed since v2.0.146)
 
     recordUpstreamSend('acct-quota-test', 'glm-5.2');
     recordUpstreamSend('acct-quota-test', 'kimi-k2-6');
 
     const res = fakeRes();
-    await handleDashboardApi('GET', '/quota-windows', {}, { headers: {} }, res);
+    await handleDashboardApi('GET', '/quota-windows', {}, localReq('/quota-windows'), res);
 
     assert.equal(res.statusCode, 200);
     const rows = res.json();
