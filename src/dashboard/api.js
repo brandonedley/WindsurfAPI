@@ -14,12 +14,13 @@ import {
   setAccountBlockedModels, setAccountTokens, setAccountTier,
   getAccountInternal, isLocalBindHost, maskApiKey, safeEqualString,
   checkLockout, failedAuthAttempt, successfulAuthAttempt,
-  getDroughtSummary,
+  getDroughtSummary, getPoolHealthWindow,
 } from '../auth.js';
 import { restartLsForProxy } from '../langserver.js';
 import { getLsStatus, stopLanguageServerAndWait, startLanguageServer, isLanguageServerRunning, getLsAdmissionStatus } from '../langserver.js';
 import { getStats, resetStats, recordRequest } from './stats.js';
 import { getQuotaWindowSummary } from '../quota-window.js';
+import { getConnectMetrics, resetConnectMetrics } from '../devin-connect-metrics.js';
 import { cacheStats, cacheClear } from '../cache.js';
 import {
   getExperimental, setExperimental, getSystemPrompts, setSystemPrompts, resetSystemPrompt,
@@ -125,14 +126,44 @@ export function buildBatchProxyBinding(result, proxy) {
   };
 }
 
+// AUTH-1 CORS hardening: the dashboard used to answer every request (and
+// every OPTIONS preflight) with `Access-Control-Allow-Origin: *` while also
+// advertising the X-Dashboard-Password header, which invites any web origin
+// to script authenticated dashboard calls from a victim's browser. We now
+// reflect only origins the operator explicitly allowlists via
+// DASHBOARD_CORS_ORIGINS (csv). Unset ⇒ no ACAO header at all (same-origin
+// dashboard use needs none; cross-origin is denied by the browser). The
+// literal `*` is still honoured but only when the operator opts in by
+// listing `*` in DASHBOARD_CORS_ORIGINS.
+function resolveCorsOrigin(req) {
+  const origin = req?.headers?.origin || '';
+  if (!origin) return '';
+  const allow = String(process.env.DASHBOARD_CORS_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (!allow.length) return '';
+  if (allow.includes('*')) return '*';
+  return allow.includes(origin) ? origin : '';
+}
+
 function json(res, status, body) {
   const data = JSON.stringify(body);
-  res.writeHead(status, {
+  const headers = {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-Dashboard-Password',
-  });
+  };
+  // Origin resolved once per request at the top of handleDashboardApi and
+  // stashed on res. Only emit ACAO when an origin is actually allowed; a
+  // specific echoed origin also needs Vary: Origin so caches don't serve
+  // one origin's CORS decision to another.
+  const acao = res?._dashboardCorsOrigin || '';
+  if (acao) {
+    headers['Access-Control-Allow-Origin'] = acao;
+    if (acao !== '*') headers['Vary'] = 'Origin';
+  }
+  res.writeHead(status, headers);
   res.end(data);
 }
 
@@ -180,11 +211,34 @@ function getAccountsPayload(req) {
 // — we only honour X-Forwarded-For when the operator opts in. Default is
 // `socket.remoteAddress` so a rogue dashboard caller can't dodge the
 // brute-force lockout by spoofing XFF and ending up on a fresh bucket.
+//
+// XFF-1 (audit P1): the LEFTMOST X-Forwarded-For token is fully attacker-
+// controllable — a client just prepends any IP. Taking parts[0] let an
+// attacker rotate the value every request to land in a fresh lockout bucket
+// and never reach the 5-strike ban. Trusted proxies APPEND the peer they
+// received the connection from to the RIGHT, so the real client IP is counted
+// from the right by TRUST_PROXY_HOPS (default 1). This MUST stay identical to
+// src/caller-key.js clientIp()/trustedProxyHops() (the source of truth) so the
+// dashboard lockout and the caller-key fingerprint can't drift apart — update
+// both together.
+function dashboardTrustedProxyHops() {
+  const raw = Number(process.env.TRUST_PROXY_HOPS);
+  return Number.isInteger(raw) && raw >= 1 ? raw : 1;
+}
+
 function dashboardClientIp(req) {
   const remote = req?.socket?.remoteAddress || req?.connection?.remoteAddress || '';
   if (process.env.TRUST_PROXY_X_FORWARDED_FOR !== '1') return remote;
-  const fwd = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
-  return fwd || remote;
+  const parts = String(req?.headers?.['x-forwarded-for'] || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (!parts.length) return remote;
+  // The last `hops` entries were appended by our trusted proxy chain; the real
+  // client IP is the entry just before them. If the header is shorter than the
+  // configured hop count it can't be trusted — fall back to the socket peer.
+  const idx = parts.length - dashboardTrustedProxyHops();
+  return (idx >= 0 ? parts[idx] : '') || remote;
 }
 
 function checkAuth(req) {
@@ -211,7 +265,38 @@ function checkAuth(req) {
   if (isLocalBindHost()) {
     const effectiveApiKey = getEffectiveApiKey();
     if (effectiveApiKey) return safeEqualString(pw, effectiveApiKey);
-    return true;
+    // AUTH-1: localhost with NO secret configured used to be treated as
+    // authenticated for every caller. Even on a loopback bind that lets any
+    // process on the host (or anything that can reach 127.0.0.1 via a
+    // container port-map / SSH forward / malicious localhost web page hitting
+    // the dashboard) drive privileged endpoints unauthenticated. Default is
+    // now fail-closed; operators who relied on the old open-local convenience
+    // must opt in explicitly with DASHBOARD_ALLOW_NO_AUTH=1.
+    return process.env.DASHBOARD_ALLOW_NO_AUTH === '1';
+  }
+  return false;
+}
+
+// AUTH-1: explicit re-auth for the reveal-key endpoint. The caller must
+// present the dashboard password AGAIN in this request even though ambient
+// dashboard auth already passed — via body.password / body.dashboardPassword
+// or the X-Dashboard-Password-Confirm header. Mirrors checkAuth()'s secret
+// resolution order (runtime/env dashboard password, then localhost API-key
+// fallback). When no secret is configured at all the re-auth is only accepted
+// on an opt-in open-local dashboard (DASHBOARD_ALLOW_NO_AUTH=1) — otherwise
+// checkAuth would already have failed closed before we get here.
+function confirmReauth(req, body) {
+  const proof = (body && typeof body === 'object'
+    && (typeof body.password === 'string' ? body.password
+      : typeof body.dashboardPassword === 'string' ? body.dashboardPassword : ''))
+    || req?.headers?.['x-dashboard-password-confirm']
+    || '';
+  const storedDashboardPw = getEffectiveDashboardPasswordStored();
+  if (storedDashboardPw) return verifyPassword(proof, storedDashboardPw);
+  if (isLocalBindHost()) {
+    const effectiveApiKey = getEffectiveApiKey();
+    if (effectiveApiKey) return safeEqualString(proof, effectiveApiKey);
+    return process.env.DASHBOARD_ALLOW_NO_AUTH === '1';
   }
   return false;
 }
@@ -265,6 +350,10 @@ async function processWindsurfLogin({ email, password, loginProxy, autoAdd }) {
  * Handle all /dashboard/api/* requests.
  */
 export async function handleDashboardApi(method, subpath, body, req, res) {
+  // Resolve the CORS origin once (allowlist-gated, default none) so every
+  // json() response — including the OPTIONS preflight below — reflects the
+  // same decision instead of a blanket `*`.
+  if (res) res._dashboardCorsOrigin = resolveCorsOrigin(req);
   if (method === 'OPTIONS') return json(res, 204, '');
 
   // v2.0.56: brute-force lockout — apply BEFORE the auth check so the
@@ -303,11 +392,15 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       else if (req.headers['x-dashboard-password']) failedAuthAttempt(clientIp);
       return json(res, 200, { required: true, valid: ok });
     }
-    // No secret configured. On localhost binds the dashboard is open; on
-    // public binds checkAuth fails closed (see Fix 1 / Fix 3) so the UI must
-    // know auth is required-but-unconfigurable so it can prompt the operator
-    // to set DASHBOARD_PASSWORD or API_KEY rather than show a useless prompt.
-    if (isLocalBindHost()) return json(res, 200, { required: false });
+    // No secret configured. AUTH-1: the open-local convenience is now
+    // opt-in — only report the dashboard as open (required:false) on a
+    // localhost bind when the operator set DASHBOARD_ALLOW_NO_AUTH=1, which
+    // mirrors checkAuth(). Otherwise (default, and on public binds) checkAuth
+    // fails closed, so the UI must show it as required-but-unconfigurable and
+    // prompt the operator to set DASHBOARD_PASSWORD or API_KEY.
+    if (isLocalBindHost() && process.env.DASHBOARD_ALLOW_NO_AUTH === '1') {
+      return json(res, 200, { required: false });
+    }
     return json(res, 200, { required: true, valid: false, locked: true });
   }
 
@@ -455,6 +548,35 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         // a bogus `origin/xxx` spec to `git fetch`.
         const safeBranch = /^[\w.\-\/]+$/.test(before.branch || '') ? before.branch : 'master';
         await runGit(['fetch', 'origin', safeBranch]);
+        // AUTH-1: `git reset --hard origin/<branch>` is destructive. forceReset
+        // covers the dirty working tree the operator explicitly chose to drop,
+        // but the same reset also silently vaporizes any LOCAL COMMITS not yet
+        // pushed to origin — irrecoverable data loss triggered by one dashboard
+        // click. Refuse when HEAD is ahead of the remote unless the operator
+        // sets the distinct DASHBOARD_ALLOW_HARD_RESET=1 opt-in.
+        let ahead = 0;
+        try {
+          ahead = parseInt((await runGit(['rev-list', '--count', `origin/${safeBranch}..HEAD`])).trim(), 10) || 0;
+        } catch { /* no upstream / detached — treat as 0, fall through */ }
+        const allowHardReset = process.env.DASHBOARD_ALLOW_HARD_RESET === '1';
+        if (ahead > 0 && !allowHardReset) {
+          return json(res, 200, {
+            ok: false,
+            dirty: true,
+            unpushedCommits: ahead,
+            error: 'ERR_UNPUSHED_COMMITS',
+            message: `Refusing hard-reset: ${ahead} local commit(s) not on origin/${safeBranch} would be lost. Set DASHBOARD_ALLOW_HARD_RESET=1 to override.`,
+            dirtyFiles: dirty.split('\n').slice(0, 20),
+          });
+        }
+        // Stash (don't discard) the working tree first so a mistaken
+        // forceReset is recoverable via `git stash pop` instead of gone
+        // forever. Best-effort — if there's nothing to stash it's a no-op.
+        try {
+          await runGit(['stash', 'push', '--include-untracked', '-m', `self-update-forceReset ${new Date().toISOString()}`]);
+        } catch (e) {
+          log.warn(`self-update: pre-reset stash failed (continuing): ${e.message}`);
+        }
         await runGit(['reset', '--hard', `origin/${safeBranch}`]);
       }
       const safeBranch = /^[\w.\-\/]+$/.test(before.branch || '') ? before.branch : 'master';
@@ -751,6 +873,20 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     return json(res, 200, { success: true });
   }
 
+  // DEVIN_CONNECT recovery health: re-login / failover / dead-token / cooldown
+  // counters + credential-store decrypt health, so an operator can watch the
+  // self-heal machinery instead of grepping logs (#36, #37).
+  if (subpath === '/connect-metrics' && method === 'GET') {
+    // C5: fold in the persisted per-account rolling-hour health window so an
+    // operator sees not just fleet-wide counters but which accounts are
+    // currently throwing throttles/errors/dead-tokens over the last hour.
+    return json(res, 200, { ...getConnectMetrics(), poolHealth: getPoolHealthWindow() });
+  }
+  if (subpath === '/connect-metrics' && method === 'DELETE') {
+    resetConnectMetrics();
+    return json(res, 200, { success: true });
+  }
+
   // ─── Logs ─────────────────────────────────────────────
   if (subpath === '/logs' && method === 'GET') {
     const url = new URL(req.url, 'http://localhost');
@@ -816,13 +952,20 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (subpath === '/logs/stream' && method === 'GET') {
     req.socket.setKeepAlive(true);
     req.setTimeout(0);
-    res.writeHead(200, {
+    const streamHeaders = {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
       'X-Accel-Buffering': 'no',
-    });
+    };
+    // Same allowlist-gated CORS as json(): only emit ACAO for an allowed
+    // origin, never a blanket `*` (see resolveCorsOrigin / AUTH-1).
+    const streamAcao = res?._dashboardCorsOrigin || '';
+    if (streamAcao) {
+      streamHeaders['Access-Control-Allow-Origin'] = streamAcao;
+      if (streamAcao !== '*') streamHeaders['Vary'] = 'Origin';
+    }
+    res.writeHead(200, streamHeaders);
     res.write('retry: 3000\n\n');
 
     // Send existing logs first
@@ -1492,6 +1635,18 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (revealKey && method === 'POST') {
     const acct = getAccountInternal(revealKey[1]);
     if (!acct) return json(res, 404, { error: 'Account not found' });
+    // AUTH-1: revealing an upstream key in cleartext is the single most
+    // sensitive read the dashboard offers. Passing ambient dashboard auth is
+    // no longer enough — require the operator to re-prove the dashboard
+    // password in THIS request (body.password / body.dashboardPassword or the
+    // X-Dashboard-Password-Confirm header), and audit-log the reveal. This
+    // blocks a drive-by (CSRF / an already-open localhost dashboard) from
+    // silently exfiltrating keys, and forces a deliberate confirmation step.
+    if (!confirmReauth(req, body)) {
+      log.warn(`reveal-key REFUSED for account ${revealKey[1]} from ${dashboardClientIp(req) || 'unknown'}: missing/invalid re-auth confirmation`);
+      return json(res, 401, { error: 'ERR_REVEAL_REAUTH_REQUIRED', message: 'Re-enter the dashboard password to reveal this key.' });
+    }
+    log.info(`reveal-key: account ${revealKey[1]} (${acct.email || 'no-email'}) revealed from ${dashboardClientIp(req) || 'unknown'}`);
     return json(res, 200, { success: true, apiKey: acct.apiKey });
   }
 

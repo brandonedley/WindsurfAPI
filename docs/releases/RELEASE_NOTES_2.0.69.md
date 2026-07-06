@@ -4,7 +4,7 @@
 
 ### v2.0.68 上 partition + reasoning effort 真生效（先报喜）
 
-`scripts/probes/v2068-end-to-end-probe.mjs` 直打 154.40.36.22 拿到的 server log：
+`scripts/probes/v2068-end-to-end-probe.mjs` 直打 <LAB_HOST> 拿到的 server log：
 
 ```
 Probe[3y8bnr]: model=gpt-5.5-xhigh stream=true tools=11 reasoning=xhigh

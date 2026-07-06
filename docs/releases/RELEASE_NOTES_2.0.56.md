@@ -68,7 +68,7 @@ VPS 升 v2.0.56 前必须先 `.env` 加这两条然后 `docker compose up -d --f
 
 ```bash
 # 必须：dashboard 现在不再用 API_KEY 回退当密码，公网 bind 不设这个 dashboard 直接 401
-DASHBOARD_PASSWORD=sk-dwgxnbnb888
+DASHBOARD_PASSWORD=sk-REDACTED
 
 # 看部署形态决定：
 #   有 nginx LB 在前面（默认 docker-compose 部署是这种）→ 设为 1

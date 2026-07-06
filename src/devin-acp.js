@@ -1,5 +1,12 @@
 import { spawn } from 'child_process';
 import { VERSION } from './version.js';
+import { log } from './config.js';
+
+// Spawn seam: `spawn` is captured behind an indirection so a test can inject a
+// fake child (EventEmitter stdio) to exercise the stdin 'error'/EPIPE guard
+// without a real Devin CLI or network. Production always uses the real spawn.
+let _spawn = spawn;
+export function __setDevinAcpSpawnForTest(fn) { _spawn = fn || spawn; }
 
 function intEnv(name, fallback, min = 0) {
   const n = parseInt(process.env[name] || '', 10);
@@ -31,6 +38,109 @@ function parseAcpArgs() {
   }
 }
 
+// ── Zero-billable proactive availability probe (AC1 gap-e / §4) ──────────────
+// AC1 left "probe before we spawn" as a nice-to-have: today the ACP runner only
+// learns the Devin CLI is missing AFTER it has reserved a pool account and
+// spawned `devin acp`, then catches ENOENT → 503. probeDevinCliAvailable lets a
+// router fail FAST and gracefully before burning a checkout/spawn.
+//
+// CRITICAL — this probe is strictly NON-billable. It runs `devin --version`
+// (exit-code + presence check) and NOTHING else. It never calls
+// initialize/authenticate/session.new/session/prompt, never opens a session,
+// never sends a prompt — so it cannot consume account quota or upstream tokens.
+// It only answers "is the binary on this box runnable?", which mirrors exactly
+// what the real `spawn(command, ['acp'])` would hit, so a probe ENOENT predicts
+// a runtime ENOENT.
+//
+// Result is cached for a short TTL (DEVIN_ACP_PROBE_TTL_MS) so a hot request
+// path doesn't fork a child on every call. DEVIN_ACP_PROBE=0 disables the probe
+// entirely (callers fall back to the passive post-spawn ENOENT→503 path).
+let _probeCache = null; // { at: epochMs, result }
+
+function parseProbeArgs() {
+  const raw = process.env.DEVIN_ACP_PROBE_ARGS_JSON || '';
+  if (!raw.trim()) return ['--version'];
+  try {
+    const args = JSON.parse(raw);
+    if (!Array.isArray(args) || !args.every(x => typeof x === 'string')) {
+      throw new Error('must be a JSON string array');
+    }
+    return args;
+  } catch {
+    // A misconfigured probe-args override must never block routing — fall back
+    // to the safe default rather than throwing inside an availability check.
+    return ['--version'];
+  }
+}
+
+function probeOnce() {
+  const command = process.env.DEVIN_CLI_PATH || 'devin';
+  const args = parseProbeArgs();
+  const timeoutMs = intEnv('DEVIN_ACP_PROBE_TIMEOUT_MS', 5000, 100);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    let child;
+    try {
+      child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] });
+    } catch (err) {
+      done({ available: false, reason: 'spawn_failed', detail: err?.code || err?.message || 'spawn threw' });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      // A version check that hangs past the timeout means a wedged binary; treat
+      // it as unavailable so we don't route to something that can't respond.
+      done({ available: false, reason: 'probe_timeout' });
+    }, timeoutMs);
+    timer.unref?.();
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      // ENOENT = not installed; EACCES = present but not executable. Both mean
+      // the same real `spawn(command, ['acp'])` would fail the same way.
+      const reason = err?.code === 'ENOENT' ? 'not_found'
+        : err?.code === 'EACCES' ? 'not_executable'
+        : 'spawn_error';
+      done({ available: false, reason, detail: err?.code || err?.message });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      // The binary exists and is executable (it ran to exit). exitCode 0 is the
+      // clean "version printed" signal; a non-zero exit still proves PRESENCE —
+      // some CLI versions don't grok `--version` — so we keep it available to
+      // avoid false-negatives that would wrongly disable a working backend, and
+      // surface the code for observability.
+      done({ available: true, reason: code === 0 ? 'ok' : 'present_nonzero_exit', exitCode: code });
+    });
+  });
+}
+
+export async function probeDevinCliAvailable({ force = false } = {}) {
+  // Opt-out: skip the active probe and assume available, deferring to the
+  // passive post-spawn ENOENT→503 path. Marked skipped so callers can tell.
+  if (String(process.env.DEVIN_ACP_PROBE || '').trim() === '0') {
+    return { available: true, skipped: true, reason: 'probe_disabled' };
+  }
+  const command = process.env.DEVIN_CLI_PATH || 'devin';
+  const argsKey = (process.env.DEVIN_ACP_PROBE_ARGS_JSON || '').trim();
+  const key = `${command} ${argsKey}`;
+  const ttlMs = intEnv('DEVIN_ACP_PROBE_TTL_MS', 60_000, 0);
+  const now = Date.now();
+  // Cache keys on the resolved command (+ probe-args override): a config change
+  // that points at a different binary must re-probe, not reuse a stale verdict.
+  if (!force && ttlMs > 0 && _probeCache && _probeCache.key === key && (now - _probeCache.at) < ttlMs) {
+    return { ..._probeCache.result, cached: true };
+  }
+  const result = await probeOnce();
+  _probeCache = { at: now, key, result };
+  return { ...result, cached: false };
+}
+
+// Test seam: drop the cached probe result so each test observes a fresh probe.
+export function __resetDevinAcpProbeCache() {
+  _probeCache = null;
+}
+
 function writeJsonLine(child, payload) {
   if (!child.stdin?.writable) return;
   child.stdin.write(`${JSON.stringify(payload)}\n`);
@@ -44,11 +154,68 @@ function parseJsonLine(line) {
   }
 }
 
+// ── Transient-first ACP error classification ────────────────────────────────
+// The ACP path spawns `devin acp` which talks to the SAME upstream as
+// DEVIN_CONNECT (server.codeium.com — authenticate _meta.api_server_url). That
+// upstream is observed (DEVIN_CONNECT live, free account <redacted>) to
+// wrap TRANSIENT faults inside an auth-shaped envelope:
+//   - "We're currently facing high demand for this model..." (capacity)
+//   - "an internal error occurred (trace ID: ...)" (backend blip in a 401/403)
+// If those reach the pool as a plain 502 backend_error they fall through to the
+// windowed generic-error streak and DISABLE a perfectly healthy account after
+// 3 hits — i.e. a retryable hiccup burns a working credential.
+//
+// So we classify ACP RPC errors with the SAME transient-first ordering as
+// devin-connect.js classifyUpstreamError, then choose an (status, type, message)
+// tuple that makes the EXISTING reportRunFailure (special-agent.js) route safely
+// WITHOUT changing that file:
+//   - CAPACITY        → status 429 → reportRunFailure → markRateLimited
+//                       (fixed cooldown, rotates out, NOT disabled). retryable.
+//   - UPSTREAM_INTERNAL→ status 502 + message keeps "internal error" →
+//                       reportRunFailure → reportInternalError (account-sticky
+//                       quarantine, NOT a re-login storm). NON-retryable
+//                       (observed persistent 3/3 — same-process replay just
+//                       amplifies load, mirrors devin-connect isRetryable).
+//   - UNAUTHORIZED    → status 401 → reportRunFailure → genericError; a GENUINE
+//                       dead token disables after the streak. Transient blips in
+//                       a 401 shell are already caught by the two branches above
+//                       (transient-first), so only real auth failures land here.
+//   - RATE_LIMITED    → status 429 → markRateLimited.
+//   - else            → 502 backend_error (unchanged legacy behaviour).
+export function classifyAcpError(message, rpcCode = null) {
+  const body = String(message || '').trim();
+  const lc = body.toLowerCase();
+
+  // Capacity / high-demand throttling — match BEFORE auth so a momentary blip
+  // never reads as a dead token. Pattern parity with devin-connect.js:597.
+  if (/high demand|try again later|currently (busy|overloaded|at capacity)|model is (busy|overloaded)|temporarily (busy|overloaded|unavailable)|server is busy|overloaded|(service|backend|model|server) (is )?(temporarily )?unavailable|capacity/i.test(lc)) {
+    return { code: 'CAPACITY', type: 'capacity_error', status: 429, retryable: true };
+  }
+  // "an internal error occurred (trace ID: ...)" — a transient BACKEND fault,
+  // NOT a dead session token, even inside a 401/403 shell. NON-retryable
+  // (devin-connect.js:643-647: observed persistent, same-token replay amplifies).
+  if (/internal error occurred|internal error/i.test(lc)) {
+    return { code: 'UPSTREAM_INTERNAL', type: 'upstream_internal', status: 502, retryable: false };
+  }
+  // Real auth failure.
+  if (/permission_denied|unauthenticated|unauthorized|invalid.*(api ?key|token)|authentication failed/i.test(lc)) {
+    return { code: 'UNAUTHORIZED', type: 'unauthorized', status: 401, retryable: false };
+  }
+  // Explicit rate limiting.
+  if (/rate.?limit|too many requests|resource_exhausted/i.test(lc)) {
+    return { code: 'RATE_LIMITED', type: 'rate_limited', status: 429, retryable: false };
+  }
+  return { code: rpcCode ? String(rpcCode) : 'UPSTREAM_ERROR', type: 'backend_error', status: 502, retryable: false };
+}
+
 function errorFromRpcResponse(resp, fallback = 'ACP request failed') {
   const msg = resp?.error?.message || fallback;
+  const { code, type, status, retryable } = classifyAcpError(msg, resp?.error?.code);
   const err = new Error(msg);
-  err.status = 502;
-  err.type = 'backend_error';
+  err.status = status;
+  err.type = type;
+  err.code = code;
+  err.retryable = retryable;
   return err;
 }
 
@@ -104,7 +271,7 @@ function collectAcpTextFromNotification(obj, buffers, onChunk) {
 }
 
 function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onChunk }) {
-  const child = spawn(command, args, {
+  const child = _spawn(command, args, {
     env,
     windowsHide: true,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -117,6 +284,14 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
   let closeCode = null;
   let fatalError = null;
   let stdoutBuffer = '';
+  // Active session id, set after session/new. Held here so an abort can send a
+  // graceful `session/cancel` notification (spec §6.1) before SIGTERM.
+  let activeSessionId = null;
+  // True once onAbort has sent session/cancel and scheduled the deferred kill.
+  // close() (called from runDevinAcpProcess's finally the instant the prompt
+  // rejects) must NOT pre-empt that grace window with an immediate SIGTERM —
+  // otherwise the child is killed before it can read the cancel notification.
+  let gracefulKillPending = false;
   const pending = new Map();
   const buffers = { message: [], thought: [] };
 
@@ -178,6 +353,28 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
 
   child.stdout.on('data', c => onData('stdout', c));
   child.stderr.on('data', c => onData('stderr', c));
+  // stdin 'error' guard (audit finding): every writeJsonLine already checks
+  // child.stdin?.writable, but that check races the child dying mid-write — if
+  // the CLI exits between the guard and the write, the write emits EPIPE on
+  // stdin as an async 'error' event. With no listener that becomes an
+  // uncaughtException and takes down the WHOLE proxy (every tenant), not just
+  // this request. Attach a swallow-and-log handler so a dead child only fails
+  // its own in-flight requests via the 'close'/'error' paths above. Wrapped in
+  // try/catch so the handler itself can never throw and re-trigger the crash.
+  if (child.stdin) {
+    child.stdin.on('error', err => {
+      try {
+        // EPIPE/ECONNRESET here just mean the child went away mid-write; the
+        // 'close' handler will fail all pending requests with a proper status.
+        // Log at debug for the expected teardown races, warn for anything else.
+        if (err?.code === 'EPIPE' || err?.code === 'ECONNRESET') {
+          log.debug(`Devin ACP stdin closed mid-write (${err.code}); child likely exited`);
+        } else {
+          log.warn(`Devin ACP stdin error: ${err?.code || err?.message || err}`);
+        }
+      } catch { /* a logging failure must never escalate into a crash */ }
+    });
+  }
   child.on('error', err => {
     if (err.code === 'ENOENT') {
       failAll(Object.assign(new Error(`Devin CLI not found: ${command}`), {
@@ -214,9 +411,28 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
   });
 
   const onAbort = () => {
+    // Graceful cancel: tell the agent to abort in-flight work for the session
+    // (spec §6.1 `session/cancel` is a notification — no id, no response) so it
+    // can clean up before we hard-kill the process. We give it a short grace
+    // window (DEVIN_ACP_CANCEL_GRACE_MS, default 250ms, 0 disables) for the
+    // notification to be read and acted on, THEN SIGTERM. The grace timer is
+    // unref'd so it never holds the event loop open, and the close handler
+    // clears it if the child exits cleanly on its own first. Best-effort: if
+    // stdin is already gone the write is a no-op and we SIGTERM immediately.
+    // The reject below uses request_aborted (499) which classifyAcpError leaves
+    // alone — an abort is a CLIENT action, never an upstream fault, so it must
+    // not touch pool health.
     const err = Object.assign(new Error('Request aborted'), { status: 499, type: 'request_aborted' });
     failAll(err);
-    child.kill('SIGTERM');
+    const graceMs = intEnv('DEVIN_ACP_CANCEL_GRACE_MS', 250, 0);
+    if (activeSessionId && child.stdin?.writable && graceMs > 0) {
+      gracefulKillPending = true;
+      writeJsonLine(child, { jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: activeSessionId } });
+      const killTimer = setTimeout(() => { if (!closed) child.kill('SIGTERM'); }, graceMs);
+      killTimer.unref?.();
+    } else {
+      child.kill('SIGTERM');
+    }
   };
   if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
@@ -246,12 +462,15 @@ function makeAcpClient({ command, args, env, signal, timeoutMs, outputLimit, onC
   const close = () => {
     if (signal) signal.removeEventListener('abort', onAbort);
     cleanup();
-    if (!closed) child.kill('SIGTERM');
+    // Don't pre-empt a graceful cancel-then-kill already scheduled by onAbort.
+    if (!closed && !gracefulKillPending) child.kill('SIGTERM');
   };
 
   return {
     request,
     close,
+    // Register the live session id so onAbort can emit `session/cancel` for it.
+    setSessionId: (id) => { activeSessionId = id || null; },
     getText: () => buffers.message.join('').trim(),
     getReasoning: () => buffers.thought.join('').trim(),
     getStderr: () => stderr.trim(),
@@ -311,6 +530,8 @@ export async function runDevinAcpProcess(prompt, { modelKey = '', apiKey = '', a
         type: 'backend_error',
       });
     }
+    // Arm graceful cancellation: a later abort can now send session/cancel.
+    client.setSessionId(sessionId);
 
     const modelHint = modelKey ? `Model requested by caller: ${modelKey}\n\n` : '';
     const result = await client.request('session/prompt', {

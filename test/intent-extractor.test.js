@@ -7,7 +7,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractIntentFromNarrative } from '../src/handlers/intent-extractor.js';
+import { extractIntentFromNarrative, detectToolIntentInNarrative } from '../src/handlers/intent-extractor.js';
 
 const fnTool = (name, props = { command: 'string' }, required = ['command']) => ({
   type: 'function',
@@ -206,5 +206,81 @@ describe('confidence threshold opt', () => {
     assert.equal(high.length, 0);
     const low = extractIntentFromNarrative(text, [SHELL_TOOL], { ...ACTIONABLE, minConfidence: 0.5 });
     assert.equal(low.length, 1);
+  });
+});
+
+// v2.0.83 (audit NLU-1): the per-tool-name regex layers (Layer 2/3 and
+// detectToolIntentInNarrative Pass 1) each scan the full text once PER
+// declared tool. With an unbounded tools[] this is O(N_tools × textLen) —
+// tens of thousands of tools × long text ≈ 10⁹–10¹⁰ synchronous regex ops
+// that freeze the single-process event loop. indexTools now caps the scan
+// at 64 distinct tool names so cost is bounded regardless of how many tools
+// a request declares.
+describe('NLU-1 — tool-count DoS bound', () => {
+  // Small-scale linearity proof: even a pathological input (tens of
+  // thousands of tools × a long narrative that name-matches every tool)
+  // must return in well under a second. Pre-fix this drives a polynomial
+  // blow-up; post-fix the scan is capped at MAX_NLU_TOOLS (64).
+  const N_TOOLS = 40_000;
+  const bigToolset = () => {
+    const tools = new Array(N_TOOLS);
+    for (let i = 0; i < N_TOOLS; i++) tools[i] = fnTool(`tool_${i}`);
+    return tools;
+  };
+  // ~200K of narrative that mentions many tool names + arg keywords, i.e.
+  // the exact shape that makes every per-tool regex do maximal work.
+  const bigText = ('Let me call the tool_1 function with command "echo X". '
+    + 'I should use `tool_2` with command `echo Y`. ').repeat(2600).slice(0, 200_000);
+
+  it('extractIntentFromNarrative returns quickly for 40K tools × long text', () => {
+    const tools = bigToolset();
+    const start = Date.now();
+    const r = extractIntentFromNarrative(bigText, tools, ACTIONABLE);
+    const elapsed = Date.now() - start;
+    assert.ok(Array.isArray(r), 'returns an array');
+    assert.ok(elapsed < 1000, `expected < 1000ms, took ${elapsed}ms (polynomial blow-up not bounded)`);
+  });
+
+  it('detectToolIntentInNarrative returns quickly for 40K tools × long text', () => {
+    const tools = bigToolset();
+    const start = Date.now();
+    const r = detectToolIntentInNarrative(bigText, tools, ACTIONABLE);
+    const elapsed = Date.now() - start;
+    assert.ok(r === null || typeof r === 'string');
+    assert.ok(elapsed < 1000, `expected < 1000ms, took ${elapsed}ms (polynomial blow-up not bounded)`);
+  });
+
+  it('scan is bounded to the first 64 declared tools', () => {
+    // A tool that only appears AFTER the 64-name cap must not be matched,
+    // even though its name is present in the narrative. This proves the
+    // scan operates on a bounded prefix of tools[] rather than all of them.
+    // Zero-pad names so none is a substring/prefix of another (the Layer 3
+    // name pattern is not end-anchored, so `tool_1` would otherwise match
+    // inside `tool_150`).
+    const pad = n => `tool_${String(n).padStart(3, '0')}`;
+    const tools = [];
+    for (let i = 0; i < 200; i++) tools.push(fnTool(pad(i), { command: 'string' }, ['command']));
+    const beyondCap = pad(150);
+    const r = extractIntentFromNarrative(
+      `I'll call ${beyondCap}(command="echo HI")`,
+      tools, ACTIONABLE,
+    );
+    assert.equal(r.length, 0, 'a tool beyond the 64-name cap is not scanned');
+    // ...but a tool within the cap still works.
+    const r2 = extractIntentFromNarrative(
+      `I'll call ${pad(0)}(command="echo HI")`,
+      tools, ACTIONABLE,
+    );
+    assert.equal(r2.length, 1);
+    assert.equal(r2[0].name, pad(0));
+  });
+
+  it('normal small toolsets are unaffected by the cap', () => {
+    const r = extractIntentFromNarrative(
+      'shell_exec(command="echo HI")',
+      [SHELL_TOOL, READ_TOOL], ACTIONABLE,
+    );
+    assert.equal(r.length, 1);
+    assert.equal(r[0].name, 'shell_exec');
   });
 });

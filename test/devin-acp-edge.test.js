@@ -100,7 +100,7 @@ describe('Devin ACP runner — config + auth boundaries', () => {
     );
   });
 
-  it('surfaces an authenticate RPC error as 502 backend_error', async () => {
+  it('surfaces an authenticate RPC error as 401 unauthorized (real dead-token shape)', async () => {
     installFakeAcp(`${HANDSHAKE}
 rl.on('line', line => {
   const msg = JSON.parse(line);
@@ -114,11 +114,18 @@ rl.on('line', line => {
   }
 });
 `);
+    // AC2 P0: "invalid api key" is a genuine auth failure → 401 unauthorized
+    // (was a blanket 502 before transient-first classification landed). It still
+    // routes to the pool's generic-error streak via reportRunFailure (401 is
+    // neither 429/402 nor a 5xx internal-error), so a truly dead token is
+    // disabled after the streak — but a transient blip in a 401 shell is caught
+    // earlier by the CAPACITY / UPSTREAM_INTERNAL branches and never lands here.
     await assert.rejects(
       () => runDevinAcpProcess('hi', { modelKey: 'swe-1.6', apiKey: 'bad-key' }),
       (err) => {
-        assert.equal(err.status, 502);
-        assert.equal(err.type, 'backend_error');
+        assert.equal(err.status, 401);
+        assert.equal(err.type, 'unauthorized');
+        assert.equal(err.code, 'UNAUTHORIZED');
         return true;
       },
     );

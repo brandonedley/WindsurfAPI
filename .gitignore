@@ -1,6 +1,10 @@
 node_modules/
 .env
 accounts.json
+accounts.creds.json
+accounts.creds.json.tmp
+devin-connect-image-tag.json
+.devin-connect-calibrated.env
 model-access.json
 sshpass.sh
 sshpass2.sh
@@ -19,6 +23,11 @@ scripts/*
 !scripts/sync-hermes-devin-ts.mjs
 !scripts/hermes-devin-verify-matrix.mjs
 !scripts/hermes-devin-live-smoke.mjs
+!scripts/devin-connect-smoke.mjs
+!scripts/devin-connect-paid-verify.mjs
+!scripts/devin-connect-image-calibrate.mjs
+!scripts/devin-connect-login.mjs
+!scripts/devin-connect-calibrate.mjs
 src/get-token.js
 src/test-cascade.js
 src/runtime-config.json
@@ -41,6 +50,13 @@ CLAUDE.md
 AGENTS.md
 GEMINI.md
 COPILOT.md
+HANDOFF.md
+.devin-connect-forward-plan.md
+.devin-connect-next-plan.md
+.devin-connect-annotations.json
+# external reference repos — audited for reference, NOT our code, never distribute
+AIClient-2-API/
+copilot2api-go/
 .cursorrules
 .windsurfrules
 .aider*
@@ -53,9 +69,21 @@ tmp-testing/
 .test-data/
 runtime-config.json
 stats.json
-package-lock.json
 *.png
 *.pem
 .docker-data/
 PR-FLOW.md
 .workflow-results/
+.paid1-session.env
+# Free-account login/session envs (tokens + credentials) — never commit
+.free*.env
+*-login.env
+*-session.env
+ghidra-proj/
+.ghidra-corpus/
+# AI session transcripts / context dumps — contain account credentials, session
+# tokens and proxy strings verbatim from the conversation; never commit
+*claudetxt.txt
+没跑完的上下文.txt
+*-context-dump.txt
+上下文*.txt

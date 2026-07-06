@@ -1,9 +1,10 @@
-import { afterEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { handleChatCompletions } from '../src/handlers/chat.js';
+import { __resetDevinAcpProbeCache } from '../src/devin-acp.js';
 import {
   getModelAccessConfig,
   setModelAccessList,
@@ -34,10 +35,19 @@ const ENV_KEYS = [
   'DEVIN_OUTPUT_LIMIT_BYTES',
   'DEVIN_CLI_WORKDIR',
   'DEVIN_ONLY',
+  'DEVIN_ACP_PROBE',
 ];
 const originalEnv = Object.fromEntries(ENV_KEYS.map(k => [k, process.env[k]]));
 const originalModelAccess = getModelAccessConfig();
 const tmpDirs = [];
+
+beforeEach(() => {
+  // The proactive availability probe (default ON) caches its verdict keyed on
+  // the resolved CLI path. Reset between tests so a prior test's path verdict
+  // never leaks into the next. installAcpBackend points at process.execPath
+  // (node --version exits 0 → available), so the real path still runs.
+  __resetDevinAcpProbeCache();
+});
 
 afterEach(() => {
   for (const k of ENV_KEYS) {
@@ -222,7 +232,11 @@ describe('ACP integration — streaming (SSE)', () => {
 });
 
 describe('ACP integration — error propagation to HTTP status', () => {
-  it('maps an ACP session/prompt RPC error to a non-2xx HTTP response (502)', async () => {
+  it('maps a transient "overloaded" ACP error to 429 capacity_error (transient-first, account NOT burned)', async () => {
+    // AC2 P0: the upstream wraps capacity faults in an RPC error. The ACP path
+    // must classify them transient-first so reportRunFailure cools the account
+    // down (markRateLimited) instead of feeding the disable-streak. Surfaced as
+    // 429 capacity_error end-to-end through the HTTP boundary.
     installAcpBackend(`
 import readline from 'node:readline';
 const rl = readline.createInterface({ input: process.stdin });
@@ -233,6 +247,28 @@ rl.on('line', line => {
   if (msg.method === 'authenticate') { send({ jsonrpc: '2.0', id: msg.id, result: {} }); return; }
   if (msg.method === 'session/new') { send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'session-1' } }); return; }
   if (msg.method === 'session/prompt') { send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'model overloaded' } }); return; }
+});
+`);
+    const result = await handleChatCompletions(
+      { model: 'swe-1.6', messages: [{ role: 'user', content: 'will fail' }] },
+      poolContext({ id: 'a', apiKey: 'k', apiServerUrl: '' }),
+    );
+    assert.equal(result.status, 429);
+    assert.equal(result.body.error.type, 'capacity_error');
+    assert.equal(result.body.error.backend, 'devin-cli');
+  });
+
+  it('maps an unrecognised ACP RPC error to 502 backend_error (legacy fallback unchanged)', async () => {
+    installAcpBackend(`
+import readline from 'node:readline';
+const rl = readline.createInterface({ input: process.stdin });
+function send(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') { send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, authMethods: [{ id: 'windsurf-api-key' }] } }); return; }
+  if (msg.method === 'authenticate') { send({ jsonrpc: '2.0', id: msg.id, result: {} }); return; }
+  if (msg.method === 'session/new') { send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'session-1' } }); return; }
+  if (msg.method === 'session/prompt') { send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'malformed prompt blob' } }); return; }
 });
 `);
     const result = await handleChatCompletions(

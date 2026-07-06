@@ -831,3 +831,131 @@ describe('native mapped-tool routing', () => {
     assert.equal(stats.emittedToolCalls, 0);
   });
 });
+
+// O5 (ROADMAP-GATE 序 8): tool_choice:'required' must be distinguishable from
+// 'auto'. The preamble layer (#G2) already differentiates; O5 closes three
+// gaps: Cascade path threads tool_choice into the user-message fallback
+// (Gap-A), diagnostics surface required explicitly (Gap-B), and
+// effectiveToolsForToolChoice keeps the full tool set for required (Gap-C).
+describe('O5 tool_choice required distinguishability', () => {
+  it('Gap-C: required keeps the FULL tool set (not narrowed, not emptied)', () => {
+    const tools = [fnTool('Read'), fnTool('Bash')];
+    assert.deepEqual(
+      effectiveToolsForToolChoice(tools, 'required').map(t => t.function.name),
+      ['Read', 'Bash'],
+    );
+    // required ≠ none (none clears the set)
+    assert.equal(effectiveToolsForToolChoice([fnTool('Read')], 'none').length, 0);
+    // Anthropic-normalized 'any' also keeps the full set
+    assert.deepEqual(
+      effectiveToolsForToolChoice(tools, 'any').map(t => t.function.name),
+      ['Read', 'Bash'],
+    );
+  });
+
+  it('Gap-B: diagnostics classify required and push tool_choice_required', () => {
+    const tools = [fnTool('Read')];
+    const plan = buildToolRoutingPlan(tools, {
+      useCascade: true, modelKey: 'claude-sonnet-4.6', provider: 'anthropic', route: 'chat',
+    });
+    const diag = summarizeToolRoutingDiagnostics({
+      tools, effectiveTools: tools, toolChoice: 'required', toolRouting: plan,
+    });
+    assert.equal(diag.toolChoiceMode, 'required');
+    assert.ok(diag.reasons.includes('tool_choice_required'));
+
+    // 'any' (Anthropic-normalized) → same required classification
+    const diagAny = summarizeToolRoutingDiagnostics({
+      tools, effectiveTools: tools, toolChoice: 'any', toolRouting: plan,
+    });
+    assert.equal(diagAny.toolChoiceMode, 'required');
+    assert.ok(diagAny.reasons.includes('tool_choice_required'));
+
+    // auto must NOT regress into required
+    const diagAuto = summarizeToolRoutingDiagnostics({
+      tools, effectiveTools: tools, toolChoice: 'auto', toolRouting: plan,
+    });
+    assert.equal(diagAuto.toolChoiceMode, 'auto');
+    assert.ok(!diagAuto.reasons.includes('tool_choice_required'));
+
+    // forced object → 'forced' mode (distinct from bare required)
+    const forced = { type: 'function', function: { name: 'Read' } };
+    const diagForced = summarizeToolRoutingDiagnostics({
+      tools, effectiveTools: tools, toolChoice: forced, toolRouting: plan,
+    });
+    assert.equal(diagForced.toolChoiceMode, 'forced');
+    assert.ok(!diagForced.reasons.includes('tool_choice_required'));
+  });
+
+  it('Gap-A: Cascade path injects the required clause into the user message', async () => {
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF = '1';
+    delete process.env.DEVIN_CONNECT;
+    const account = addAccountByKey(`o5-required-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'o5-required');
+    createdAccountIds.push(account.id);
+
+    let captured = null;
+    class FakeClient {
+      async cascadeChat(messages) {
+        captured = messages;
+        return Object.assign([{ text: 'ok' }], { toolCalls: [] });
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: false,
+      messages: [{ role: 'user', content: 'do it' }],
+      tools: [fnTool('Read'), fnTool('Bash')],
+      tool_choice: 'required',
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    assert.ok(Array.isArray(captured));
+    const lastUser = [...captured].reverse().find(m => m.role === 'user');
+    const text = typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content);
+    assert.match(text, /MUST call at least one/i);
+  });
+
+  it('Gap-A control: default tool_choice does NOT inject the required clause', async () => {
+    delete process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE;
+    process.env.WINDSURFAPI_NATIVE_TOOL_BRIDGE_OFF = '1';
+    delete process.env.DEVIN_CONNECT;
+    const account = addAccountByKey(`o5-auto-${Date.now()}-${Math.random().toString(36).slice(2)}`, 'o5-auto');
+    createdAccountIds.push(account.id);
+
+    let captured = null;
+    class FakeClient {
+      async cascadeChat(messages) {
+        captured = messages;
+        return Object.assign([{ text: 'ok' }], { toolCalls: [] });
+      }
+    }
+
+    const result = await handleChatCompletions({
+      model: 'claude-sonnet-4.6',
+      stream: false,
+      messages: [{ role: 'user', content: 'do it' }],
+      tools: [fnTool('Read'), fnTool('Bash')],
+    }, {
+      waitForAccount(tried, _signal, _maxWaitMs, modelKey) {
+        return tried.length === 0 ? getApiKey(tried, modelKey) : null;
+      },
+      ensureLs: async () => {},
+      getLsFor: () => ({ port: 17777, csrfToken: 'csrf', generation: 1 }),
+      WindsurfClient: FakeClient,
+    });
+
+    assert.equal(result.status, 200);
+    const lastUser = [...captured].reverse().find(m => m.role === 'user');
+    const text = typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content);
+    assert.doesNotMatch(text, /MUST call at least one/i);
+  });
+});

@@ -64,6 +64,35 @@ describe('cacheKey', () => {
     assert.notEqual(cacheKey({ ...base, stop: ['END'] }), cacheKey(base));
     assert.notEqual(cacheKey({ ...base, seed: 1 }), cacheKey({ ...base, seed: 2 }));
   });
+
+  it('O3: max_completion_tokens and equal max_tokens collapse to one slot', () => {
+    // The two spellings are the same generation, so they must share a cache key —
+    // otherwise a client migrating from max_tokens to max_completion_tokens would
+    // never hit the warm cache for an identical request.
+    const base = { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] };
+    assert.equal(
+      cacheKey({ ...base, max_completion_tokens: 256 }),
+      cacheKey({ ...base, max_tokens: 256 })
+    );
+  });
+
+  it('O3: differing output caps still key apart', () => {
+    const base = { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] };
+    assert.notEqual(
+      cacheKey({ ...base, max_completion_tokens: 256 }),
+      cacheKey({ ...base, max_completion_tokens: 512 })
+    );
+  });
+
+  it('O3: max_completion_tokens takes precedence over max_tokens in the key', () => {
+    // Both present → the modern field wins, matching handleChatCompletions. So a
+    // body with max_completion_tokens:500 keys the same regardless of max_tokens.
+    const base = { model: 'gpt-4o', messages: [{ role: 'user', content: 'hi' }] };
+    assert.equal(
+      cacheKey({ ...base, max_completion_tokens: 500, max_tokens: 100 }),
+      cacheKey({ ...base, max_completion_tokens: 500 })
+    );
+  });
 });
 
 describe('cacheGet / cacheSet', () => {

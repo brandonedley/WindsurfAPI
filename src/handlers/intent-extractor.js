@@ -52,10 +52,24 @@ import { log } from '../config.js';
  * @property {number} confidence  0..1
  */
 
+// v2.0.83 (audit NLU-1): the per-tool-name regex layers (Layer 2/3 and
+// detectToolIntentInNarrative Pass 1) each scan the full text once PER
+// declared tool, so an unbounded tools[] turns NLU recovery into
+// O(N_tools × textLen) synchronous regex work — tens of thousands of tools
+// × 200K text ≈ 10⁹–10¹⁰ regex ops that freeze the single-process event
+// loop and DoS every tenant. Cap the number of tool names that participate
+// in the scan (all three loops iterate `names`, so bounding its size bounds
+// every scan). NLU recovery is best-effort, so operating on the first N
+// declared tools is an acceptable degradation.
+const MAX_NLU_TOOLS = 64;
+
 /**
  * Build a Set of declared tool names + a name → primaryParamName map
  * for inference of single-arg shorthands ("with command 'echo X'" →
  * arguments.command = 'echo X').
+ *
+ * At most MAX_NLU_TOOLS distinct names are indexed (audit NLU-1); scanning
+ * more than that per text is the polynomial blow-up we must not allow.
  */
 function indexTools(tools) {
   const names = new Set();
@@ -84,6 +98,11 @@ function indexTools(tools) {
       }
       if (primary) primaryParam.set(name, primary);
     }
+    // Stop once we've indexed the cap's worth of DISTINCT names. Placed at
+    // the end of the body so the current tool's primaryParam is recorded
+    // first. Bounds both the scan cost AND this indexing loop even when a
+    // request declares tens of thousands of tools.
+    if (names.size >= MAX_NLU_TOOLS) break;
   }
   return { names, primaryParam };
 }

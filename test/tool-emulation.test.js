@@ -404,6 +404,83 @@ describe('buildToolPreamble (injection-guard safety)', () => {
   });
 });
 
+describe('buildToolPreamble tool_choice passthrough (#G2)', () => {
+  // The DEVIN_CONNECT path has no native function-calling slot, so tool_choice
+  // can only reach the model via the prompt. Before #G2 the user-message
+  // fallback hard-coded 'auto' and silently dropped required/forced/none.
+  // These assertions lock the four tool_choice values to their prompt clauses.
+  // NB: whether the upstream model actually OBEYS a forced/required constraint
+  // under text emulation needs a live/paid token to confirm — TODO(unverified).
+  const tools = [
+    { type: 'function', function: { name: 'Bash', description: 'Run a shell command.', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+    { type: 'function', function: { name: 'Read', description: 'Read a file.', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } } },
+  ];
+
+  it('auto (default) emits no tool_choice constraint clause — no regression', () => {
+    const auto = buildToolPreamble(tools, 'auto');
+    const bare = buildToolPreamble(tools);
+    assert.equal(auto, bare, 'explicit auto must equal the default-arg output');
+    assert.ok(!/MUST call/i.test(auto), 'auto must not force a call');
+    assert.ok(!/Do NOT call any function/i.test(auto), 'auto must not forbid calls');
+  });
+
+  it('required injects a "must call at least one" constraint', () => {
+    const req = buildToolPreamble(tools, 'required');
+    assert.match(req, /MUST call at least one of these functions/i);
+    assert.ok(!/the function "/.test(req), 'required (no name) must not name a specific function');
+  });
+
+  it('forced {function:{name}} injects a "must call X" constraint', () => {
+    const forced = buildToolPreamble(tools, { type: 'function', function: { name: 'Bash' } });
+    assert.match(forced, /MUST call the function "Bash"/);
+    assert.match(forced, /no other function and no plain-text answer/i);
+  });
+
+  it('forced bare {name} shape is honoured too', () => {
+    const forced = buildToolPreamble(tools, { name: 'Read' });
+    assert.match(forced, /MUST call the function "Read"/);
+  });
+
+  it('none injects a "do not call" constraint', () => {
+    const none = buildToolPreamble(tools, 'none');
+    assert.match(none, /Do NOT call any function this turn/i);
+  });
+
+  it('tool_choice clauses stay free of injection-guard trigger phrases and system-prompt shape', () => {
+    for (const tc of ['required', 'none', { function: { name: 'Bash' } }]) {
+      const out = buildToolPreamble(tools, tc);
+      assert.doesNotMatch(out, /\bIGNORE\b/i);
+      assert.doesNotMatch(out, /for this request only/i);
+      assert.doesNotMatch(out, /disregard/i);
+      assert.ok(!/^### /m.test(out), 'no ### headers');
+      assert.ok(!/```json/i.test(out), 'no json fences');
+      assert.ok(out.length < 768, `stays compact; got ${out.length}`);
+    }
+  });
+
+  it('normalizeMessagesForCascade threads toolChoice into the injected preamble', () => {
+    const out = normalizeMessagesForCascade(
+      [{ role: 'user', content: 'do the thing' }],
+      tools,
+      { route: 'devin_connect', toolChoice: { type: 'function', function: { name: 'Bash' } } },
+    );
+    const last = out[out.length - 1];
+    assert.equal(last.role, 'user');
+    assert.ok(last.content.endsWith('do the thing'));
+    assert.match(last.content, /MUST call the function "Bash"/);
+  });
+
+  it('normalizeMessagesForCascade defaults to auto (no constraint) when toolChoice omitted', () => {
+    const out = normalizeMessagesForCascade(
+      [{ role: 'user', content: 'hi' }],
+      tools,
+      { route: 'devin_connect' },
+    );
+    const last = out[out.length - 1];
+    assert.ok(!/MUST call/i.test(last.content), 'omitted toolChoice must stay auto');
+  });
+});
+
 describe('buildCompactToolPreambleForProto (payload budget fallback)', () => {
   // Issue #67-adjacent: Claude Code can ship 30+ tools, each with multi-KB
   // parameter schemas. The full proto-level preamble was being doubled into

@@ -21,10 +21,12 @@ import {
   addAccountByEmail, addAccountByToken, addAccountByKey, removeAccount,
   configureBindHost, emitNoAuthWarnings, getDroughtSummary, ensureLsForAccount,
 } from './auth.js';
-import { handleChatCompletions } from './handlers/chat.js';
-import { handleMessages } from './handlers/messages.js';
+import { handleChatCompletions, normalizeOpenAIErrorBody } from './handlers/chat.js';
+import { handleMessages, handleCountTokens, validateMessagesRequest, validateCountTokensRequest } from './handlers/messages.js';
+import { handleGemini, parseGeminiPath } from './handlers/gemini.js';
 import { handleResponses } from './handlers/responses.js';
 import { handleModels } from './handlers/models.js';
+import { resolveModel, getModelInfo } from './models.js';
 import { handleDashboardApi, parseProxyUrl, validateProxyHost } from './dashboard/api.js';
 import { setAccountProxy } from './dashboard/proxy-config.js';
 import { config, log } from './config.js';
@@ -39,6 +41,28 @@ const VERSION_INFO = getVersionInfo();
 // 10 MB is way above any realistic chat-completions payload while still
 // bounding worst-case memory from a malicious/broken client.
 export const MAX_BODY_SIZE = 10 * 1024 * 1024;
+
+// G1: Anthropic 官方要求客户端发 `anthropic-version` 请求头(如 2023-06-01)。
+// 作为兼容代理我们取宽容路线:缺失不返 400,而是 warn + 回退默认版本(理由见
+// SPEC-G1);未知版本也不硬失败(向前兼容),原样接受并回写。当前翻译层不因版本
+// 分叉,故解析结果仅用于回写响应头 + 诊断日志。
+const ANTHROPIC_DEFAULT_VERSION = '2023-06-01';
+const ANTHROPIC_KNOWN_VERSIONS = new Set(['2023-06-01', '2023-01-01']);
+
+// 读取并归一 anthropic-version 请求头。返回生效版本字符串(缺失→默认)。
+// Node 已把头名小写化,直接取 req.headers['anthropic-version']。
+export function resolveAnthropicVersion(req) {
+  const raw = req && req.headers ? String(req.headers['anthropic-version'] || '').trim() : '';
+  if (!raw) {
+    log.warn('anthropic-version header missing; defaulting to ' + ANTHROPIC_DEFAULT_VERSION);
+    return ANTHROPIC_DEFAULT_VERSION;
+  }
+  if (!ANTHROPIC_KNOWN_VERSIONS.has(raw)) {
+    // 向前兼容:未知/未来版本不拒绝,原样透传。
+    log.warn('anthropic-version unrecognized: ' + raw.slice(0, 40) + ' (accepting as-is)');
+  }
+  return raw;
+}
 
 export function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -81,9 +105,11 @@ export function bodyTooLargePayload(style = 'openai') {
     return { error: 'Request body too large' };
   }
   if (style === 'anthropic') {
-    return { type: 'error', error: { type: 'invalid_request_error', message: 'Request body too large' } };
+    // D1: 413 maps to the dedicated request_too_large type (not
+    // invalid_request_error), aligning with toAnthropicError(413).
+    return { type: 'error', error: { type: 'request_too_large', message: 'Request body too large' } };
   }
-  return { error: { message: 'Request body too large', type: 'invalid_request' } };
+  return { error: { message: 'Request body too large', type: 'invalid_request_error' } };
 }
 
 function sendBodyTooLargeIfNeeded(res, err, style = 'openai') {
@@ -95,9 +121,19 @@ function sendBodyTooLargeIfNeeded(res, err, style = 'openai') {
 export function extractToken(req) {
   // Anthropic SDK + OAI SDK compatibility: accept either header.
   const authHeader = String(req.headers['authorization'] || '').trim();
-  if (authHeader && authHeader.includes(',')) return '';
+  // TOK-3 (audit P3): a comma used to blanket-clear the token — so a caller
+  // sending `Authorization: Bearer my,key` (or a duplicate header Node joined
+  // as `Bearer a, Bearer b`) was rejected AND the x-api-key fallback was
+  // skipped, 401ing even when a correct x-api-key was present. Instead, parse
+  // the Bearer credential and take only its FIRST comma-delimited segment: a
+  // duplicate/injected `Bearer a, Bearer b` can't smuggle a second credential,
+  // a stray comma no longer nukes auth, and — because we fall through when the
+  // Bearer segment is empty — x-api-key still works.
   const m = authHeader.match(/^Bearer\s+(.+)$/i);
-  if (m) return m[1].trim();
+  if (m) {
+    const first = m[1].split(',')[0].trim();
+    if (first) return first;
+  }
   const xApiKey = req.headers['x-api-key'] || '';
   return xApiKey;
 }
@@ -128,9 +164,33 @@ function json(res, status, body) {
   res.end(data);
 }
 
+// F4: inject a top-level request_id into ERROR bodies only (status >= 400),
+// reusing the exact value already emitted in the x-request-id/request-id
+// header so a client can log/correlate the same id from either place. OpenAI
+// and Anthropic both carry request_id in their error envelopes; success bodies
+// stay header-only (both APIs omit it from success payloads). Non-object bodies
+// pass through untouched, and an existing request_id is never clobbered.
+export function withRequestId(status, body, requestId) {
+  if (status < 400) return body;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  if (body.request_id != null) return body;
+  return { ...body, request_id: requestId };
+}
+
+function anthropicModelPayload(id, info) {
+  return {
+    type: 'model',
+    id: info?.name || id,
+    display_name: info?.name || id,
+    created_at: '2026-01-01T00:00:00Z',
+  };
+}
+
 async function route(req, res) {
   const { method } = req;
   let path = req.url.split('?')[0];
+  // Tolerate a doubled `/v1/v1/` prefix some clients emit.
+  if (path.startsWith('/v1/v1/')) path = path.slice(3);
 
   if (method === 'OPTIONS') {
     res.writeHead(204, {
@@ -374,35 +434,56 @@ async function route(req, res) {
     return json(res, 200, handleModels());
   }
 
+  if (path.startsWith('/v1/models/') && method === 'GET') {
+    const rawId = decodeURIComponent(path.slice('/v1/models/'.length));
+    const modelKey = resolveModel(rawId);
+    const info = getModelInfo(modelKey);
+    if (!info) {
+      return json(res, 404, { type: 'error', error: { type: 'not_found_error', message: `Model ${rawId} not found` } });
+    }
+    return json(res, 200, anthropicModelPayload(rawId, info));
+  }
+
   if (path === '/v1/chat/completions' && method === 'POST') {
     if (!isAuthenticated()) {
       return json(res, 503, {
-        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'auth_error' },
+        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
       });
     }
 
     let body;
     try { body = JSON.parse(await readBody(req)); } catch (err) {
       if (sendBodyTooLargeIfNeeded(res, err, 'openai')) return;
-      return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request' } });
+      return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
     }
     if (!Array.isArray(body.messages)) {
-      return json(res, 400, { error: { message: 'messages must be an array', type: 'invalid_request' } });
+      return json(res, 400, { error: { message: 'messages must be an array', type: 'invalid_request_error' } });
     }
     if (body.messages.length === 0) {
-      return json(res, 400, { error: { message: 'messages must contain at least 1 item', type: 'invalid_request' } });
+      return json(res, 400, { error: { message: 'messages must contain at least 1 item', type: 'invalid_request_error' } });
     }
 
     const reqStartedAt = Date.now();
     const token = extractToken(req);
     const callerKey = callerKeyFromRequest(req, token, body);
+    // Thread a client-disconnect AbortSignal into the handler context so a
+    // caller that hangs up mid-flight tears down the in-flight upstream call
+    // and — on the DEVIN_CONNECT path — stops the failover loop from hopping
+    // fresh pooled accounts to a dead socket. The messages/gemini/responses
+    // routes drive their disconnect through their translator fake-res instead;
+    // this is the missing wiring on the direct OpenAI route. Guard on
+    // !writableEnded so the normal end-of-response 'close' is a no-op.
+    const abortController = new AbortController();
+    res.on('close', () => { if (!res.writableEnded) abortController.abort(); });
     const result = await handleChatCompletions(body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
+      signal: abortController.signal,
     });
     const processingMs = Date.now() - reqStartedAt;
+    const requestId = 'req_' + randomUUID();
     const modelHeaders = {
-      'x-request-id': 'req-' + randomUUID(),
+      'x-request-id': requestId,
       'openai-model': body.model || '',
       // Actual upstream processing time — hvoy.ai and similar verifiers
       // treat a flat "0" as a fingerprint of a faking proxy.
@@ -421,7 +502,11 @@ async function route(req, res) {
       if (result.headers) {
         for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
       }
-      json(res, result.status, result.body);
+      // O10: normalize internal error.type to the official OpenAI vocabulary at
+      // the egress boundary; no-op on success bodies. F4: inject the same
+      // request_id emitted in x-request-id into the error body (status >= 400).
+      normalizeOpenAIErrorBody(result.body, result.status);
+      json(res, result.status, withRequestId(result.status, result.body, requestId));
     }
     return;
   }
@@ -436,17 +521,17 @@ async function route(req, res) {
   if (path === '/v1/responses' && method === 'POST') {
     if (!isAuthenticated()) {
       return json(res, 503, {
-        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'auth_error' },
+        error: { message: 'No active accounts. POST /auth/login to add accounts.', type: 'api_error' },
       });
     }
 
     let body;
     try { body = JSON.parse(await readBody(req)); } catch (err) {
       if (sendBodyTooLargeIfNeeded(res, err, 'openai')) return;
-      return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request' } });
+      return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
     }
     if (body.input == null) {
-      return json(res, 400, { error: { message: 'input is required', type: 'invalid_request' } });
+      return json(res, 400, { error: { message: 'input is required', type: 'invalid_request_error' } });
     }
 
     const reqStartedAt = Date.now();
@@ -459,8 +544,9 @@ async function route(req, res) {
       },
     });
     const processingMs = Date.now() - reqStartedAt;
+    const requestId = 'req_' + randomUUID();
     const modelHeaders = {
-      'x-request-id': 'req-' + randomUUID(),
+      'x-request-id': requestId,
       'openai-model': body.model || '',
       'openai-processing-ms': String(processingMs),
       'openai-version': '2020-10-01',
@@ -474,15 +560,43 @@ async function route(req, res) {
       if (result.headers) {
         for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
       }
-      json(res, result.status, result.body);
+      // O10 + F4: /v1/responses is OpenAI-family — same egress normalize +
+      // request_id injection as /v1/chat/completions.
+      normalizeOpenAIErrorBody(result.body, result.status);
+      json(res, result.status, withRequestId(result.status, result.body, requestId));
     }
     return;
   }
 
   // Anthropic Messages API — Claude Code compatibility
+  if (path === '/v1/messages/count_tokens' && method === 'POST') {
+    if (!isAuthenticated()) {
+      // D2: no-account gate is a transient capacity condition, not a fatal
+      // server bug. 503 api_error was self-contradictory (503 isn't in the
+      // Anthropic status set; api_error implies 500). 529 overloaded_error is
+      // the official retryable status so SDKs back off and retry.
+      return json(res, 529, { type: 'error', error: { type: 'overloaded_error', message: 'No active accounts available, please retry' } });
+    }
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch (err) {
+      if (sendBodyTooLargeIfNeeded(res, err, 'anthropic')) return;
+      return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON' } });
+    }
+    // E4: model is required by the official count_tokens API.
+    const invalid = validateCountTokensRequest(body);
+    if (invalid) return json(res, invalid.status, invalid.body);
+    // G1: count_tokens is also an Anthropic-family endpoint — echo the version
+    // header for symmetry with /v1/messages (no stream here, so setHeader).
+    const anthropicVersion = resolveAnthropicVersion(req);
+    const result = handleCountTokens(body);
+    res.setHeader('anthropic-version', anthropicVersion);
+    return json(res, result.status, result.body);
+  }
+
   if (path === '/v1/messages' && method === 'POST') {
     if (!isAuthenticated()) {
-      return json(res, 503, { type: 'error', error: { type: 'api_error', message: 'No active accounts' } });
+      // D2: see count_tokens above — transient capacity → 529 overloaded_error.
+      return json(res, 529, { type: 'error', error: { type: 'overloaded_error', message: 'No active accounts available, please retry' } });
     }
     let body;
     try { body = JSON.parse(await readBody(req)); } catch (err) {
@@ -492,27 +606,96 @@ async function route(req, res) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
+    // C1/C3/C4: enforce max_tokens (required, positive int) and cache_control
+    // validity (ephemeral type, ttl ∈ {5m,1h}, ≤4 breakpoints) at the entry.
+    const invalid = validateMessagesRequest(body);
+    if (invalid) return json(res, invalid.status, invalid.body);
     const token = extractToken(req);
     const callerKey = callerKeyFromRequest(req, token, body);
+    // G1: read the anthropic-version request header (warn+default when missing,
+    // accept-as-is when unknown). Passed into context as a seam for future
+    // version-gated behavior; the translation layer does not branch on it today.
+    const anthropicVersion = resolveAnthropicVersion(req);
     const result = await handleMessages(body, {
       callerKey,
       nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
+      anthropicVersion,
     });
+    const requestId = 'req_' + randomUUID();
     const anthropicHeaders = {
-      'request-id': 'req-' + randomUUID(),
+      'request-id': requestId,
       'anthropic-model': body.model || '',
+      // G1: echo the effective version back so clients can confirm it.
+      'anthropic-version': anthropicVersion,
     };
     if (result.stream) {
       res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...anthropicHeaders, ...result.headers });
       await result.handler(res);
     } else {
       for (const [k, v] of Object.entries(anthropicHeaders)) res.setHeader(k, v);
+      // F4: inject request_id into Anthropic error bodies (status >= 400),
+      // matching {type:'error', error:{...}, request_id}. O10 does NOT touch
+      // Anthropic — toAnthropicError owns its own status vocabulary.
+      json(res, result.status, withRequestId(result.status, result.body, requestId));
+    }
+    return;
+  }
+
+  // ── Google Gemini API (generativelanguage) v1beta frontend ──
+  // POST /v1beta/models/{model}:generateContent        → non-stream
+  // POST /v1beta/models/{model}:streamGenerateContent  → stream
+  //   default wire format is a JSON array of GenerateContentResponse;
+  //   ?alt=sse switches to an SSE stream (preferred by newer SDKs).
+  // The {model} segment can carry dots/dashes; the method is the suffix
+  // after the final ':'. A v1 alias path is accepted too.
+  if (method === 'POST' && /\/models\/[^:/]+:(generateContent|streamGenerateContent)$/.test(path)) {
+    if (!isAuthenticated()) {
+      return json(res, 503, { error: { code: 503, message: 'No active accounts. POST /auth/login to add accounts.', status: 'UNAVAILABLE' } });
+    }
+    const parsed = parseGeminiPath(path);
+    if (!parsed) {
+      return json(res, 404, { error: { code: 404, message: `${method} ${path} not found`, status: 'NOT_FOUND' } });
+    }
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch (err) {
+      if (sendBodyTooLargeIfNeeded(res, err, 'openai')) return;
+      return json(res, 400, { error: { code: 400, message: 'Invalid JSON', status: 'INVALID_ARGUMENT' } });
+    }
+    if (!Array.isArray(body.contents) || body.contents.length === 0) {
+      return json(res, 400, { error: { code: 400, message: 'contents must be a non-empty array', status: 'INVALID_ARGUMENT' } });
+    }
+    const wantStream = parsed.method === 'streamGenerateContent';
+    const alt = new URL(req.url, 'http://localhost').searchParams.get('alt');
+    const token = extractToken(req);
+    const callerKey = callerKeyFromRequest(req, token, body);
+    const result = await handleGemini(parsed.model, body, {
+      callerKey,
+      nativeBridgeCallerKey: nativeBridgeCallerKeyForRequest(req, token, body, callerKey),
+    }, { stream: wantStream, alt });
+    const geminiHeaders = { 'request-id': 'req_' + randomUUID() };
+    if (result.stream) {
+      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...geminiHeaders, ...result.headers });
+      await result.handler(res);
+    } else {
+      for (const [k, v] of Object.entries(geminiHeaders)) res.setHeader(k, v);
       json(res, result.status, result.body);
     }
     return;
   }
 
-  json(res, 404, { error: { message: `${method} ${path} not found`, type: 'not_found' } });
+  // D4: the Anthropic surface (/v1/messages*) must get an Anthropic-shaped
+  // error body, not the OpenAI {error:{message,type}} shape, so SDK clients
+  // parse it correctly instead of choking on an unknown envelope.
+  if (isAnthropicPath(path)) {
+    return json(res, 404, { type: 'error', error: { type: 'not_found_error', message: `${method} ${path} not found` } });
+  }
+  json(res, 404, { error: { message: `${method} ${path} not found`, type: 'not_found_error' } });
+}
+
+// D4: paths under the Anthropic Messages surface. Fallback 404/500 handlers use
+// this to choose the Anthropic error envelope over the default OpenAI one.
+function isAnthropicPath(path) {
+  return typeof path === 'string' && path.startsWith('/v1/messages');
 }
 
 export function startServer() {
@@ -528,7 +711,16 @@ export function startServer() {
       await route(req, res);
     } catch (err) {
       log.error('Handler error:', err);
-      if (!res.headersSent) json(res, 500, { error: { message: 'Internal error', type: 'server_error' } });
+      if (!res.headersSent) {
+        // D4: Anthropic surface gets the Anthropic error envelope; everything
+        // else keeps the OpenAI-shaped {error:{message,type}} body.
+        const path = String(req.url || '').split('?')[0];
+        if (isAnthropicPath(path)) {
+          json(res, 500, { type: 'error', error: { type: 'api_error', message: 'Internal server error' } });
+        } else {
+          json(res, 500, { error: { message: 'Internal error', type: 'server_error' } });
+        }
+      }
     }
   });
 
@@ -558,6 +750,10 @@ export function startServer() {
     log.info(`Server on http://${bindHost}:${config.port}`);
     log.info('  POST /v1/chat/completions');
     log.info('  POST /v1/responses');
+    log.info('  POST /v1/messages         (Anthropic)');
+    log.info('  POST /v1/messages/count_tokens');
+    log.info('  POST /v1beta/models/{model}:generateContent       (Gemini)');
+    log.info('  POST /v1beta/models/{model}:streamGenerateContent (Gemini)');
     log.info('  GET  /v1/models');
     log.info('  POST /auth/login          (add account)');
     log.info('  GET  /auth/accounts       (list accounts)');

@@ -32,7 +32,7 @@ Firebase Web SDK 的 `signInWithPopup` 走 `https://exa2-fb170.firebaseapp.com/_
 - 本地 dev (`localhost`) — Firebase 默认 allow
 - 自己有 HTTPS 域名 + 自己跑独立 Firebase project — 自己加
 
-我们的生产 VPS（裸 IP `154.40.36.22:3888`）+ 大多数 self-hosted 部署都不满足，OAuth popup 会立刻报 `auth/unauthorized-domain`。绕不过去。所以 inline token paste 才是 universally-working 的方案。
+我们的生产 VPS（裸 IP `<LAB_HOST>:3888`）+ 大多数 self-hosted 部署都不满足，OAuth popup 会立刻报 `auth/unauthorized-domain`。绕不过去。所以 inline token paste 才是 universally-working 的方案。
 
 ### Verification
 

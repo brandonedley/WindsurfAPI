@@ -1,4 +1,6 @@
-# Star & Follow me and I'll leave you alone
+# WindsurfAPI
+
+> Turn Windsurf / Devin's 100+ AI models (Claude, GPT, Gemini, DeepSeek, Kimi, GLM, SWE…) into OpenAI / Anthropic / Gemini standard APIs. Zero npm runtime dependencies.
 
 <p align="center">
   <a href="https://github.com/dwgx/WindsurfAPI/stargazers"><img src="https://img.shields.io/github/stars/dwgx/WindsurfAPI?style=for-the-badge&logo=github&color=f5c518" alt="Stars"></a>&nbsp;
@@ -366,7 +368,7 @@ The service automatically detects Chinese, Japanese, or Korean characters in you
 
 ## Architecture Highlights
 
-- **Zero npm dependencies** Everything uses `node:*` built-ins · Protobuf is handcrafted (`src/proto.js`) · Download and run.
+- **Zero npm dependencies** Everything uses `node:*` built-ins · Protobuf is handcrafted (`src/proto.js`) · image codecs vendored (`src/vendor/`, BSD-3 jpeg-js + an original pure-Node PNG decoder) · download and run.
 - **Account Pool + LS Pool** Each independent proxy gets its own LS instance, no mixing.
 - **NO_TOOL Mode** `planner_mode=3` disables Cascade's built-in tool loop to prevent `/tmp/windsurf-workspace/` path leakage.
 - **Three-layer sanitization** LS built-in tool result filtering · `<tool_call>` text parsing · Output path cleaning.

@@ -23,7 +23,7 @@ v2.0.51 抠掉了上游 100% 拒的 6 个 SKU 但实际拿 sub2api 真接 Windsu
 ### 实测拓扑
 
 ```
-Client → sub2api(43.153.139.136:8090) → WindsurfAPI(154.40.36.22:3888) → Cascade upstream
+Client → sub2api(<PROD_VPS>:8090) → WindsurfAPI(<LAB_HOST>:3888) → Cascade upstream
         [Anthropic /v1/messages]      [apikey type, base_url override]
 ```
 

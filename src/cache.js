@@ -109,7 +109,12 @@ function normalize(body) {
     stream_options: body.stream_options || null,
     temperature: body.temperature ?? null,
     top_p: body.top_p ?? null,
-    max_tokens: body.max_tokens ?? null,
+    // O3: resolve max_completion_tokens (modern OpenAI spelling) with the same
+    // precedence handleChatCompletions uses, so the two field names collapse to
+    // one cache dimension — a request sending max_completion_tokens:N and one
+    // sending max_tokens:N are the same generation and share a cache slot, while
+    // differing caps still key apart.
+    max_tokens: (Number.isFinite(body.max_completion_tokens) ? body.max_completion_tokens : body.max_tokens) ?? null,
     // Output-affecting params — omitting these served a response generated
     // under a different stop/seed/penalty config for an otherwise-identical
     // body. `stop` is set from Anthropic stop_sequences in messages.js.

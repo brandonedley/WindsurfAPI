@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { config } from '../src/config.js';
@@ -13,6 +13,7 @@ const originalDashboardPassword = config.dashboardPassword;
 const originalApiKey = config.apiKey;
 const originalHost = config.host;
 const originalPort = config.port;
+const originalAllowNoAuth = process.env.DASHBOARD_ALLOW_NO_AUTH;
 const createdAccountIds = new Set();
 let runningServer = null;
 
@@ -30,7 +31,20 @@ function snapshotAccountIds() {
   return getAccountList().map(a => a.id);
 }
 
+beforeEach(() => {
+  // These cases exercise proxy ordering/validation via the dashboard on
+  // localhost with no secret configured. Post-AUTH-1 that is fail-closed by
+  // default, so opt into the open-local convenience to preserve the original
+  // (proxy-focused) intent of each case.
+  process.env.DASHBOARD_ALLOW_NO_AUTH = '1';
+});
+
 afterEach(async () => {
+  if (originalAllowNoAuth === undefined) {
+    delete process.env.DASHBOARD_ALLOW_NO_AUTH;
+  } else {
+    process.env.DASHBOARD_ALLOW_NO_AUTH = originalAllowNoAuth;
+  }
   if (runningServer) {
     await new Promise(resolve => runningServer.close(resolve));
     runningServer = null;

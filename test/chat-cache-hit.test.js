@@ -48,13 +48,16 @@ afterEach(() => {
 });
 
 describe('chat cache-hit stream shape', () => {
-  it('matches the live-stream finish chunk plus terminal usage chunk shape', async () => {
+  it('matches the live-stream finish chunk plus terminal usage chunk shape (include_usage:true)', async () => {
     const account = addAccountByKey(`cache-key-${Date.now()}`, 'cache-hit');
     createdAccountIds.push(account.id);
 
     const body = {
       model: 'gemini-2.5-flash',
       stream: true,
+      // O1: the trailing usage frame is opt-in; this test asserts its shape, so
+      // it explicitly opts in.
+      stream_options: { include_usage: true },
       messages: [{ role: 'user', content: 'hi' }],
     };
     cacheSet(cacheKey(body), { text: 'cached answer', thinking: 'cached thinking' });
@@ -83,5 +86,53 @@ describe('chat cache-hit stream shape', () => {
       completion_tokens_details: { reasoning_tokens: 0 },
     });
     assert.equal(frames.at(-1), '[DONE]');
+  });
+
+  it('O1: omits the trailing usage frame by default (no stream_options)', async () => {
+    const account = addAccountByKey(`cache-key-${Date.now()}-nou`, 'cache-hit');
+    createdAccountIds.push(account.id);
+
+    const body = {
+      model: 'gemini-2.5-flash',
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    cacheSet(cacheKey(body), { text: 'cached answer', thinking: 'cached thinking' });
+
+    const result = await handleChatCompletions(body);
+    assert.equal(result.status, 200);
+
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseChatFrames(res.body);
+
+    // No frame carries a usage block, and the last real chunk is the finish
+    // chunk (choices[0].finish_reason), immediately followed by [DONE].
+    const usageFrames = frames.filter(f => f !== '[DONE]' && 'usage' in f);
+    assert.deepEqual(usageFrames, [], 'no usage frame without include_usage');
+    assert.equal(frames.at(-1), '[DONE]');
+    const finishChunk = frames.at(-2);
+    assert.equal(finishChunk.choices[0].finish_reason, 'stop');
+  });
+
+  it('O1: include_usage:false explicitly also omits the usage frame', async () => {
+    const account = addAccountByKey(`cache-key-${Date.now()}-false`, 'cache-hit');
+    createdAccountIds.push(account.id);
+
+    const body = {
+      model: 'gemini-2.5-flash',
+      stream: true,
+      stream_options: { include_usage: false },
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    cacheSet(cacheKey(body), { text: 'cached answer', thinking: 'cached thinking' });
+
+    const result = await handleChatCompletions(body);
+    const res = fakeRes();
+    await result.handler(res);
+    const frames = parseChatFrames(res.body);
+
+    const usageFrames = frames.filter(f => f !== '[DONE]' && 'usage' in f);
+    assert.deepEqual(usageFrames, [], 'include_usage:false → no usage frame');
   });
 });

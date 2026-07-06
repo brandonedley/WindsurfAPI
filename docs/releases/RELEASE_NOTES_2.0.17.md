@@ -1,6 +1,6 @@
 ## v2.0.17 — 安全加固一波过：fail-closed auth、apiKey 脱敏、LS port 不再盲接管、gRPC 异常不再炸进程
 
-这是 codex 全面审计 + 我审计 + codex 互审的产出，5 个 HIGH、1 个 MED 回归（v2.0.16 我自己埋的）、若干 LOW 一次性收掉。生产部署 154.40.36.22 是公网 IP，这些不修是真的危险。
+这是 codex 全面审计 + 我审计 + codex 互审的产出，5 个 HIGH、1 个 MED 回归（v2.0.16 我自己埋的）、若干 LOW 一次性收掉。生产部署 <LAB_HOST> 是公网 IP，这些不修是真的危险。
 
 This release closes a comprehensive security audit. Five HIGH, one MED regression I introduced in v2.0.16, several LOW. The proxy runs on a public IP in production; these were not theoretical.
 

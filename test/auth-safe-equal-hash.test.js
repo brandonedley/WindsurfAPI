@@ -8,7 +8,7 @@ import { safeEqualString } from '../src/auth.js';
 
 describe('safeEqualString — hash-based, no length oracle (audit L1)', () => {
   it('returns true for identical strings', () => {
-    assert.equal(safeEqualString('sk-dwgxnbnb888', 'sk-dwgxnbnb888'), true);
+    assert.equal(safeEqualString('sk-example-key-1234', 'sk-example-key-1234'), true);
     assert.equal(safeEqualString('', ''), true);
     assert.equal(safeEqualString('a', 'a'), true);
   });

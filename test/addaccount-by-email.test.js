@@ -1,8 +1,7 @@
 // addAccountByEmail wiring + CheckUserLoginMethod empty-body fallback.
 //
-// Two regressions that surfaced together when dwgx tested email login on
-// VPS 154.40.36.22 against three real accounts (Joshua/Susan/Barbara,
-// 2026-04-29):
+// Two regressions that surfaced together when email login was tested on
+// a lab host against three real accounts (2026-04-29):
 //
 // 1. src/auth.js `addAccountByEmail` had been stubbed to throw
 //    `"Direct email/password login is not supported"`. The dashboard had

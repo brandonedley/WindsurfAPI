@@ -1,0 +1,532 @@
+{
+  "_comment": "Committed snapshot of the live GetCliModelConfigs catalog, calibrated 2026-07-05 against the PAID teams account (redacted). Each entry is {selector, alias, provider}. Aliases are non-unique FAMILY names (e.g. claude-opus-4.8 covers low/medium/high/xhigh/max); an alias resolves to ONE curated default variant (prefer -medium). The offline drift test asserts every selector resolves to itself and every alias resolves (mapped) to a real catalog selector. Refresh via the paid preflight capture.",
+  "_calibratedAt": "2026-07-05",
+  "_count": 105,
+  "models": [
+    {
+      "selector": "claude-opus-4-8-medium",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-5-fable-medium",
+      "alias": "claude-5-fable",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-medium",
+      "alias": "claude-sonnet-5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "glm-5-2",
+      "alias": "glm-5.2",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "gpt-5-5-low",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "kimi-k2-7",
+      "alias": "kimi-k2.7",
+      "provider": "moonshot"
+    },
+    {
+      "selector": "swe-1-6",
+      "alias": "swe-1.6",
+      "provider": "cognition"
+    },
+    {
+      "selector": "swe-1-6-fast",
+      "alias": "swe-1.6-fast",
+      "provider": "cognition"
+    },
+    {
+      "selector": "claude-opus-4-7-medium",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-low",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-high",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-xhigh",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-max",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-low-fast",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-medium-fast",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-high-fast",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-xhigh-fast",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-7-max-fast",
+      "alias": "claude-opus-4.7",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-low",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-high",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-xhigh",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-max",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-low-fast",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-medium-fast",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-high-fast",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-xhigh-fast",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-8-max-fast",
+      "alias": "claude-opus-4.8",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-5-fable-low",
+      "alias": "claude-5-fable",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-5-fable-high",
+      "alias": "claude-5-fable",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-5-fable-xhigh",
+      "alias": "claude-5-fable",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-5-fable-max",
+      "alias": "claude-5-fable",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-low",
+      "alias": "claude-sonnet-5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-high",
+      "alias": "claude-sonnet-5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-xhigh",
+      "alias": "claude-sonnet-5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-5-max",
+      "alias": "claude-sonnet-5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "gemini-3-5-flash-minimal",
+      "alias": "gemini-3.5-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-5-flash-low",
+      "alias": "gemini-3.5-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-5-flash-medium",
+      "alias": "gemini-3.5-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-5-flash-high",
+      "alias": "gemini-3.5-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "glm-5-2-max",
+      "alias": "glm-5.2",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-2-1m",
+      "alias": "glm-5.2",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-2-max-1m",
+      "alias": "glm-5.2",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-2-none",
+      "alias": "glm-5.2",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "glm-5-2-none-1m",
+      "alias": "glm-5.2",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "claude-opus-4-6",
+      "alias": "claude-opus-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-6-thinking",
+      "alias": "claude-opus-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-6-1m",
+      "alias": "claude-opus-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-opus-4-6-thinking-1m",
+      "alias": "claude-opus-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "gpt-5-4-none",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-low",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-medium",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-high",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-xhigh",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-none",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-medium",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-high",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-xhigh",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-none-priority",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-low-priority",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-medium-priority",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-high-priority",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-5-xhigh-priority",
+      "alias": "gpt-5.5",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-none-priority",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-low-priority",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-medium-priority",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-high-priority",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-xhigh-priority",
+      "alias": "gpt-5.4",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-mini-low",
+      "alias": "gpt-5.4-mini",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-mini-medium",
+      "alias": "gpt-5.4-mini",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-mini-high",
+      "alias": "gpt-5.4-mini",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-4-mini-xhigh",
+      "alias": "gpt-5.4-mini",
+      "provider": "openai"
+    },
+    {
+      "selector": "claude-sonnet-4-6",
+      "alias": "claude-sonnet-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-4-6-thinking",
+      "alias": "claude-sonnet-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-4-6-1m",
+      "alias": "claude-sonnet-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "claude-sonnet-4-6-thinking-1m",
+      "alias": "claude-sonnet-4.6",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "MODEL_GPT_5_2_LOW",
+      "alias": "gpt-5.2",
+      "provider": "openai"
+    },
+    {
+      "selector": "MODEL_GPT_5_2_MEDIUM",
+      "alias": "gpt-5.2",
+      "provider": "openai"
+    },
+    {
+      "selector": "MODEL_CLAUDE_4_5_OPUS",
+      "alias": "claude-opus-4.5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "MODEL_CLAUDE_4_5_OPUS_THINKING",
+      "alias": "claude-opus-4.5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "MODEL_SWE_1_5",
+      "alias": "",
+      "provider": "cognition"
+    },
+    {
+      "selector": "MODEL_PRIVATE_11",
+      "alias": "",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "MODEL_PRIVATE_2",
+      "alias": "claude-sonnet-4.5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "MODEL_PRIVATE_3",
+      "alias": "claude-sonnet-4.5",
+      "provider": "anthropic"
+    },
+    {
+      "selector": "MODEL_GPT_5_2_NONE",
+      "alias": "gpt-5.2",
+      "provider": "openai"
+    },
+    {
+      "selector": "MODEL_GPT_5_2_HIGH",
+      "alias": "gpt-5.2",
+      "provider": "openai"
+    },
+    {
+      "selector": "MODEL_GPT_5_2_XHIGH",
+      "alias": "gpt-5.2",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-low",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-medium",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-high",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-xhigh",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-low-priority",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-medium-priority",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-high-priority",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "gpt-5-3-codex-xhigh-priority",
+      "alias": "gpt-5.3-codex",
+      "provider": "openai"
+    },
+    {
+      "selector": "kimi-k2-6",
+      "alias": "kimi-k2.6",
+      "provider": "moonshot"
+    },
+    {
+      "selector": "glm-5-1",
+      "alias": "glm-5.1",
+      "provider": "zhipu"
+    },
+    {
+      "selector": "MODEL_SWE_1_5_SLOW",
+      "alias": "",
+      "provider": "cognition"
+    },
+    {
+      "selector": "gemini-3-1-pro-low",
+      "alias": "gemini-3.1-pro",
+      "provider": "google"
+    },
+    {
+      "selector": "gemini-3-1-pro-high",
+      "alias": "gemini-3.1-pro",
+      "provider": "google"
+    },
+    {
+      "selector": "MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL",
+      "alias": "gemini-3.0-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW",
+      "alias": "gemini-3.0-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM",
+      "alias": "gemini-3.0-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH",
+      "alias": "gemini-3.0-flash",
+      "provider": "google"
+    },
+    {
+      "selector": "deepseek-v4",
+      "alias": "deepseek-v4",
+      "provider": "6"
+    },
+    {
+      "selector": "swe-1-6-slow",
+      "alias": "swe-1.6-slow",
+      "provider": "cognition"
+    }
+  ]
+}

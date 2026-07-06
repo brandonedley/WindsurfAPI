@@ -113,7 +113,26 @@ export function buildToolPreamble(tools, toolChoice = 'auto', modelKey = null, p
   const antiRefusal = dialect === 'gpt_native'
     ? `The functions ARE available; if you need to read a file or run a command, call the function — never reply "please paste the file" or "I do not have access".`
     : '';
-  return `Tools available this turn: ${names.join(', ')}. To call one, emit a single-line block: ${emit}.${antiRefusal ? ' ' + antiRefusal : ''} ${hints.join(' ')} ${WORKSPACE_PATH_HINT} Otherwise answer directly in plain text. After the last call, stop generating; the caller returns results in the next turn as <tool_result tool_call_id="...">...</tool_result>.`;
+  // tool_choice constraint (#G2). The fallback historically hard-coded
+  // "auto" and silently dropped the caller's tool_choice on the
+  // DEVIN_CONNECT path (no proto tool_calling_section slot exists there, so
+  // prompt text is the only channel). Emit a single matter-of-fact clause
+  // that respects the injection-shape constraints above: no `### …`
+  // headers, no ```json fences, no jailbreak vocab, stays compact. Whether
+  // the upstream model actually obeys a forced/required constraint under
+  // text emulation can only be confirmed with a live/paid token —
+  // TODO(unverified). `auto` keeps the prior wording exactly (no clause)
+  // so existing behaviour and tests do not regress.
+  const { mode, forceName } = resolveToolChoice(toolChoice);
+  let choiceClause = '';
+  if (forceName) {
+    choiceClause = ` You MUST call the function "${forceName}" this turn — no other function and no plain-text answer.`;
+  } else if (mode === 'required') {
+    choiceClause = ` You MUST call at least one of these functions this turn — do not answer in plain text.`;
+  } else if (mode === 'none') {
+    choiceClause = ` Do NOT call any function this turn — answer the user directly in plain text.`;
+  }
+  return `Tools available this turn: ${names.join(', ')}. To call one, emit a single-line block: ${emit}.${antiRefusal ? ' ' + antiRefusal : ''}${choiceClause} ${hints.join(' ')} ${WORKSPACE_PATH_HINT} Otherwise answer directly in plain text. After the last call, stop generating; the caller returns results in the next turn as <tool_result tool_call_id="...">...</tool_result>.`;
 }
 
 /**
@@ -361,8 +380,11 @@ function resolveToolChoice(tc) {
   if (!tc || tc === 'auto') return { mode: 'auto', forceName: null };
   if (tc === 'required' || tc === 'any') return { mode: 'required', forceName: null };
   if (tc === 'none') return { mode: 'none', forceName: null };
-  if (typeof tc === 'object' && tc.function?.name) {
-    return { mode: 'required', forceName: tc.function.name };
+  if (typeof tc === 'object' && (tc.function?.name || tc.name)) {
+    // Accept both the OpenAI/Anthropic-normalized shape `{function:{name}}`
+    // and the bare `{name}` shape. effectiveToolsForToolChoice (chat.js)
+    // already filters on both, so resolve the forced name the same way here.
+    return { mode: 'required', forceName: tc.function?.name || tc.name };
   }
   return { mode: 'auto', forceName: null };
 }
@@ -688,12 +710,75 @@ function prependPreambleToContent(content, preamble) {
   return `${preamble}\n\n${cur}`;
 }
 
+// TOOL-1 — role:tool results are folded into a synthetic user turn wrapped
+// in <tool_result …>…</tool_result>. Both the content and the tool_call_id
+// are attacker-influenced: a tool result is typically a fetched web page, a
+// file, or command stdout. Without neutralization, a body containing a
+// literal `</tool_result>\n<tool_call>{…}</tool_call>` — or a tool_call_id
+// like `x"><tool_call>` — closes the wrapper early and smuggles a forged
+// <tool_call> up to the top level, where the upstream model reads it as its
+// own instruction and emits a REAL tool call (Bash/Read/…) that the client
+// then executes locally. Neutralize the wrapper sentinels the same way
+// client.js:escapeHistoryTag neutralizes closing tags in replayed history,
+// and narrow the id to a conservative charset so it cannot break out of the
+// quoted attribute.
+const TOOL_CALL_ID_ALLOWED = /[A-Za-z0-9_.:-]/g;
+
+function sanitizeToolCallId(rawId) {
+  if (typeof rawId !== 'string' || !rawId) return 'unknown';
+  const cleaned = (rawId.match(TOOL_CALL_ID_ALLOWED) || []).join('').slice(0, 128);
+  return cleaned || 'unknown';
+}
+
+// TOOL-1 — neutralize any tool-call/tool-result markers embedded in an
+// (attacker-influenced) tool_result body before it is folded into the prompt,
+// so a hostile tool output can't smuggle a forged tool call in the exact
+// marker syntax the model is told to emit and have the downstream parser
+// (ToolCallStreamParser / parseToolCallsFromText) treat it as a real call.
+//
+// The XML-family sentinels (<tool_call> / <tool_result>) cover openai_json_xml
+// AND glm47 (glm47 emits/parses <tool_call>). The Kimi vLLM dialect uses
+// distinctive <|tool_..._begin|> / <|...|> tokens that never occur innocently
+// in normal text, so we break them unconditionally regardless of the active
+// dialect (defense-in-depth — a session may mix dialects across turns).
+//
+// gpt_native's "markers" are bare JSON objects ({"function_call":…}); those are
+// only salvage-parsed from the MODEL'S OWN OUTPUT, never from tool_result
+// prompt content, and escaping JSON braces here would corrupt legitimate JSON
+// tool results — so gpt_native needs no marker escaping on this path.
+const KIMI_SENTINELS = [
+  '<|tool_calls_section_begin|>',
+  '<|tool_calls_section_end|>',
+  '<|tool_call_begin|>',
+  '<|tool_call_argument_begin|>',
+  '<|tool_call_end|>',
+];
+function neutralizeToolResultBody(text) {
+  let out = String(text ?? '')
+    .replaceAll('</tool_result>', '<\\/tool_result>')
+    .replaceAll('<tool_result', '<\\tool_result')
+    .replaceAll('</tool_call>', '<\\/tool_call>')
+    .replaceAll('<tool_call>', '<\\tool_call>');
+  // Break the Kimi section/call tokens by injecting a backslash after the
+  // leading `<|` so the literal sentinel no longer matches, while the text
+  // stays human-legible.
+  for (const s of KIMI_SENTINELS) {
+    out = out.replaceAll(s, `<\\|${s.slice(2)}`);
+  }
+  return out;
+}
+
 export function normalizeMessagesForCascade(messages, tools, options = {}) {
   if (!Array.isArray(messages)) return messages;
   const injectUserPreamble = options.injectUserPreamble !== false;
   const modelKey = options.modelKey || null;
   const provider = options.provider || null;
   const route = options.route || null;
+  // tool_choice (#G2): default 'auto' preserves the prior hard-coded
+  // behaviour. The DEVIN_CONNECT path (chat.js) now threads the caller's
+  // tool_choice through so required/forced constraints reach the prompt;
+  // the Cascade path can keep passing nothing and stays on 'auto'.
+  const toolChoice = options.toolChoice ?? 'auto';
   const dialect = pickToolDialect(modelKey, provider, route);
   const out = [];
 
@@ -701,10 +786,11 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
     if (!m || !m.role) { out.push(m); continue; }
 
     if (m.role === 'tool') {
-      const id = m.tool_call_id || 'unknown';
-      const content = typeof m.content === 'string'
+      const id = sanitizeToolCallId(m.tool_call_id);
+      const rawContent = typeof m.content === 'string'
         ? m.content
         : JSON.stringify(m.content ?? '');
+      const content = neutralizeToolResultBody(rawContent);
       out.push({
         role: 'user',
         content: `<tool_result tool_call_id="${id}">\n${content}\n</tool_result>`,
@@ -748,7 +834,7 @@ export function normalizeMessagesForCascade(messages, tools, options = {}) {
   // confused prose with zero tool_calls and hit max_wait. Skipping the
   // preamble on tool_result turns lets Opus stay in tool-using mode for
   // the full conversation, matching native-Anthropic-API behaviour.
-  const preamble = buildToolPreamble(tools, 'auto', modelKey, provider, route);
+  const preamble = buildToolPreamble(tools, toolChoice, modelKey, provider, route);
   if (preamble && injectUserPreamble) {
     for (let i = out.length - 1; i >= 0; i--) {
       if (out[i].role !== 'user') continue;
@@ -945,6 +1031,11 @@ export class ToolCallStreamParser {
     this.buffer = '';
     this.inToolCall = false;
     this.inToolResult = false;
+    // TOOL-3 — remember the exact <tool_result …> open tag we consumed so an
+    // unclosed block can be regurgitated verbatim as text at flush() instead
+    // of being silently swallowed (which returned an empty response to the
+    // client with no error).
+    this._toolResultOpenTag = '';
     this.inToolCode = false;
     this.inBareCall = false;
     this._totalSeen = 0;
@@ -1066,6 +1157,20 @@ export class ToolCallStreamParser {
         this.buffer = this.buffer.slice(earliest);
         return { text, toolCalls: [], items: [{ type: 'text', text }] };
       }
+      // TOOL-2 — sentinel sits at buffer start (earliest===0): every later
+      // delta appends to the held buffer until flush. Unlike the XML path
+      // (which caps <tool_call>/<tool_result> bodies at TOOL_XML_BODY_MAX),
+      // this branch had no ceiling, so a model that opens a tool-call
+      // sentinel and then streams unbounded text pins it all in memory. Cap
+      // it the same way: once the held buffer exceeds the limit without a
+      // parseable close, flush it as ordinary text and reset so RSS stays
+      // bounded.
+      if (this.buffer.length > TOOL_XML_BODY_MAX) {
+        log.warn(`ToolCallStreamParser: ${this.dialect} sentinel body exceeds 65KB (${this.buffer.length} bytes), emitting as text`);
+        const text = this.buffer;
+        this.buffer = '';
+        return { text, toolCalls: [], items: [{ type: 'text', text }] };
+      }
       return { text: '', toolCalls: [], items: [] };
     }
     this.buffer += delta;
@@ -1097,12 +1202,14 @@ export class ToolCallStreamParser {
           log.warn(`ToolCallStreamParser: <tool_result> body exceeds 65KB (${this.buffer.length} bytes), dropping`);
           this.buffer = '';
           this.inToolResult = false;
+          this._toolResultOpenTag = '';
           continue;
         }
         const closeIdx = this.buffer.indexOf(TR_CLOSE);
         if (closeIdx === -1) break;
         this.buffer = this.buffer.slice(closeIdx + TR_CLOSE.length);
         this.inToolResult = false;
+        this._toolResultOpenTag = '';
         continue;
       }
 
@@ -1154,7 +1261,21 @@ export class ToolCallStreamParser {
       // ── Normal mode — scan for the next opening tag ──
       const mode = TOOL_PARSE_MODE;
       const tcIdx = (mode === 'auto' || mode === 'xml') ? this.buffer.indexOf(TC_OPEN) : -1;
-      const trIdx = this.buffer.indexOf(TR_PREFIX);
+      // TOOL-3 — tighten <tool_result open-tag matching: the bare prefix must
+      // be followed by '>' or whitespace (i.e. `<tool_result>` or
+      // `<tool_result tool_call_id=…>`). A bare indexOf also matched
+      // substrings like `<tool_resultset`, spuriously opening a discard block
+      // and swallowing the model's real output. A prefix sitting exactly at
+      // the buffer tail (delimiter not yet streamed) is still returned as a
+      // candidate so the closeAngle check below holds it until more input
+      // arrives, rather than leaking a split real tag as text.
+      let trIdx = -1;
+      for (let p = this.buffer.indexOf(TR_PREFIX); p !== -1; p = this.buffer.indexOf(TR_PREFIX, p + 1)) {
+        const after = p + TR_PREFIX.length;
+        if (after >= this.buffer.length) { trIdx = p; break; }
+        const ch = this.buffer[after];
+        if (ch === '>' || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') { trIdx = p; break; }
+      }
       const tcCodeIdx = this.parseToolCode && (mode === 'auto' || mode === 'tool_code') ? this.buffer.indexOf(TC_CODE) : -1;
       const tcBareIdx = this.parseBareJson && (mode === 'auto' || mode === 'json') ? this.buffer.indexOf(TC_BARE) : -1;
 
@@ -1202,6 +1323,9 @@ export class ToolCallStreamParser {
           this.buffer = this.buffer.slice(nextIdx);
           break;
         }
+        // Preserve the literal open tag for faithful regurgitation if the
+        // matching </tool_result> never arrives (TOOL-3).
+        this._toolResultOpenTag = this.buffer.slice(nextIdx, closeAngle + 1);
         this.buffer = this.buffer.slice(closeAngle + 1);
         this.inToolResult = true;
       } else if (tagType === 'code') {
@@ -1237,8 +1361,17 @@ export class ToolCallStreamParser {
       return { text: `<tool_call>${remaining}`, toolCalls: [] };
     }
     if (this.inToolResult) {
+      // TOOL-3 — an unclosed <tool_result …> block reached end-of-stream.
+      // Regurgitate the open tag + held body as text rather than silently
+      // returning an empty response (the old behaviour let a model emit a
+      // stray `<tool_result>` and lose its entire turn, and let TOOL-1-style
+      // injected `<tool_result` prefixes erase real output). The
+      // </tool_result> the client would emit never came, so this is genuine
+      // model prose, not a synthetic wrapper.
       this.inToolResult = false;
-      return { text: '', toolCalls: [] };
+      const openTag = this._toolResultOpenTag || TR_PREFIX;
+      this._toolResultOpenTag = '';
+      return { text: `${openTag}${remaining}`, toolCalls: [] };
     }
     if (this.inToolCode) {
       this.inToolCode = false;

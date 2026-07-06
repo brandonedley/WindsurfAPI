@@ -22,10 +22,16 @@
 
 ### Commit & PR
 
-- commit 格式 `type: 简短说明` 例如 `fix: chat stream 漏 usage 字段`
-- type 用 `feat` / `fix` / `refactor` / `docs` / `chore`
-- 标题写清楚改了啥 Body 写为什么改 而不是怎么改（diff 自己会说）
-- 一个 PR 解决一件事 多件事拆开提
+- commit 格式 `type(scope): 简短说明`，scope 可选但推荐（写受影响的模块）。例：
+  - `fix(auth,server): account-pool safety — bounded lockout map, id-based refcount`
+  - `feat(devin-connect): tool_call nativization stage-0 — fix double-send, def-gate outer=10`
+- type 只用：`feat` / `fix` / `refactor` / `perf` / `docs` / `test` / `chore` / `ci` / `revert`
+- subject 全小写英文、祈使句、无句号；多个改动点用 `—`(em dash)接补充、`+` 连列
+- 复杂改动写 body（bullet 列表）：每条 `文件: 改了什么（为什么/追溯标记）`，追溯标记如审计 ID(`PNG-1`)、审查缺口(`R2`/`O1`)、issue(`#192`)
+- **调试日志不单独成 commit**（不要 `debug:` 类型）；调试代码在合并前清掉或并进功能 commit
+- 一个 commit / 一个 PR 解决一件事，多件事按主题拆开
+- **绝不在 commit message 里加任何 AI / 助手署名尾注**（`Co-Authored-By: Claude`、`Generated with…` 等一律不写）
+- 标题写清楚改了啥，body 写为什么改，而不是怎么改（diff 自己会说）
 
 ### 测试
 
@@ -61,10 +67,17 @@ GitHub Actions 跑 `node --check` 做语法校验 过了就可以 review。
 
 ### Commits & PRs
 
-- Format: `type: short description` e.g. `fix: chat stream missing usage field`.
-- Types: `feat` / `fix` / `refactor` / `docs` / `chore`.
+- Format: `type(scope): short description`. Scope optional but encouraged (the modules touched). e.g.
+  - `fix(auth,server): account-pool safety — bounded lockout map, id-based refcount`
+  - `feat(devin-connect): tool_call nativization stage-0 — fix double-send, def-gate outer=10`
+- Types (only): `feat` / `fix` / `refactor` / `perf` / `docs` / `test` / `chore` / `ci` / `revert`.
+- Subject: lowercase, imperative, no trailing period; join extra clauses with `—` (em dash), list items with `+`.
+- Non-trivial changes get a body (bullet list): each line `file: what changed (why / trace tag)`, where a trace tag is an audit ID (`PNG-1`), review gap (`R2`/`O1`), or issue (`#192`).
+- **Debug logging is never its own commit** (no `debug:` type); strip debug code before merge or fold it into the feature commit.
+- One commit / one PR per concern. Split unrelated changes.
+- **Never add any AI / assistant attribution trailer** to a commit message (`Co-Authored-By: Claude`, `Generated with…`, etc.).
 - Title = what changed. Body = why (the diff speaks for how).
-- One PR per concern. Split unrelated changes.
+- Enable the commit template locally: `git config commit.template .gitmessage`
 
 ### Testing
 

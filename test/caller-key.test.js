@@ -38,6 +38,89 @@ describe('extractBodyCallerSubKey (v2.0.25 HIGH-3)', () => {
   });
 });
 
+describe('extractBodyCallerSubKey empty-value fail-closed (audit)', () => {
+  // Before the fix, `typeof body.user === 'string'` accepted "" / "   " and
+  // hashed them to the constant sha256("") prefix, minting a shared :user:
+  // segment across every distinct end user of a common key (cross-tenant
+  // answer bleed). Empty/whitespace must fall through, never mint a scope.
+  it('returns empty for user:"" (no constant sha256("") scope)', () => {
+    assert.equal(extractBodyCallerSubKey({ user: '' }), '');
+  });
+
+  it('returns empty for whitespace-only user', () => {
+    assert.equal(extractBodyCallerSubKey({ user: '   ' }), '');
+    assert.equal(extractBodyCallerSubKey({ user: '\t\n ' }), '');
+  });
+
+  it('empty user does NOT collapse to a real user digest', () => {
+    const empty = extractBodyCallerSubKey({ user: '' });
+    const real = extractBodyCallerSubKey({ user: 'alice' });
+    assert.equal(empty, '');
+    assert.notEqual(empty, real);
+  });
+
+  it('falls through to sibling candidates when user is empty', () => {
+    // Empty user must not short-circuit; a real conversation id should
+    // still produce a scope via the candidates path.
+    const k = extractBodyCallerSubKey({ user: '', conversation: 'conv-xyz' });
+    assert.ok(k && k.length === 16);
+    // and it must match the same body without the empty user field
+    assert.equal(k, extractBodyCallerSubKey({ conversation: 'conv-xyz' }));
+  });
+
+  it('empty sibling fields (conversation / previous_response_id / metadata.*) mint no scope', () => {
+    assert.equal(extractBodyCallerSubKey({ conversation: '' }), '');
+    assert.equal(extractBodyCallerSubKey({ conversation: '   ' }), '');
+    assert.equal(extractBodyCallerSubKey({ previous_response_id: '' }), '');
+    assert.equal(extractBodyCallerSubKey({ metadata: { conversation_id: '' } }), '');
+    assert.equal(extractBodyCallerSubKey({ metadata: { session_id: '  ' } }), '');
+    assert.equal(
+      extractBodyCallerSubKey({ user: '', conversation: '', previous_response_id: '', metadata: { conversation_id: '', session_id: '' } }),
+      '',
+    );
+  });
+});
+
+describe('callerKeyFromRequest empty-user fail-closed (audit)', () => {
+  it('user:"" does NOT mint :user: — falls back to :client: (IP+UA)', () => {
+    const k = callerKeyFromRequest(fakeReq(), 'sk-test-key', { user: '' });
+    assert.doesNotMatch(k, /:user:/);
+    assert.match(k, /^api:[a-f0-9]+:client:[a-f0-9]{16}$/);
+  });
+
+  it('whitespace user:"   " does NOT mint :user:', () => {
+    const k = callerKeyFromRequest(fakeReq(), 'sk-test-key', { user: '   ' });
+    assert.doesNotMatch(k, /:user:/);
+  });
+
+  it('empty and whitespace users do NOT collapse into the same callerKey as each other or a real user', () => {
+    // Distinct physical clients so the :client: fallback keeps them apart;
+    // if the empty-user bug were present both would carry the same constant
+    // :user: segment and compare equal regardless of IP/UA.
+    const kEmpty = callerKeyFromRequest(
+      fakeReq({ ip: '1.1.1.1', headers: { 'user-agent': 'cli/a' } }), 'shared', { user: '' },
+    );
+    const kSpace = callerKeyFromRequest(
+      fakeReq({ ip: '2.2.2.2', headers: { 'user-agent': 'cli/b' } }), 'shared', { user: '   ' },
+    );
+    const kReal = callerKeyFromRequest(
+      fakeReq({ ip: '3.3.3.3', headers: { 'user-agent': 'cli/c' } }), 'shared', { user: 'alice' },
+    );
+    assert.notEqual(kEmpty, kSpace);
+    assert.notEqual(kEmpty, kReal);
+    assert.notEqual(kSpace, kReal);
+  });
+
+  it('a real non-empty user still scopes as before', () => {
+    const k = callerKeyFromRequest(fakeReq(), 'sk-test-key', { user: 'alice' });
+    assert.match(k, /^api:[a-f0-9]+:user:[a-f0-9]{16}$/);
+  });
+
+  it('hasCallerScope stays false for an empty-user body with no other signal', () => {
+    assert.equal(hasCallerScope('api:abc', fakeReq({ headers: {} }), { user: '' }), false);
+  });
+});
+
 describe('callerKeyFromRequest with body', () => {
   it('appends :user:<digest> when body has a user signal', () => {
     const k = callerKeyFromRequest(fakeReq(), 'sk-test-key', { user: 'alice' });

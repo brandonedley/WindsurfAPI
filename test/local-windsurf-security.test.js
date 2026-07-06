@@ -8,6 +8,7 @@ import { setRuntimeApiKey, setRuntimeDashboardPassword } from '../src/runtime-co
 
 const originalDashboardPassword = config.dashboardPassword;
 const originalApiKey = config.apiKey;
+const originalAllowNoAuth = process.env.DASHBOARD_ALLOW_NO_AUTH;
 
 afterEach(() => {
   _resetLockoutForTests();
@@ -16,6 +17,8 @@ afterEach(() => {
   config.dashboardPassword = originalDashboardPassword;
   config.apiKey = originalApiKey;
   configureBindHost('127.0.0.1');
+  if (originalAllowNoAuth === undefined) delete process.env.DASHBOARD_ALLOW_NO_AUTH;
+  else process.env.DASHBOARD_ALLOW_NO_AUTH = originalAllowNoAuth;
 });
 
 function fakeRes() {
@@ -69,6 +72,11 @@ describe('GET /accounts/import-local (security posture)', () => {
     config.dashboardPassword = '';
     config.apiKey = '';
     configureBindHost('127.0.0.1');
+    // AUTH-1: opt in to open-local so ambient auth passes; the point of this
+    // case is the SECOND-layer loopback guard — a non-loopback remote caller
+    // must still be rejected (403 ERR_LOCAL_IMPORT_LOOPBACK_ONLY) even when
+    // the dashboard itself is unauthenticated-open.
+    process.env.DASHBOARD_ALLOW_NO_AUTH = '1';
 
     const res = fakeRes();
     await handleDashboardApi(
@@ -90,6 +98,9 @@ describe('GET /accounts/import-local (security posture)', () => {
     config.dashboardPassword = '';
     config.apiKey = '';
     configureBindHost('127.0.0.1');
+    // AUTH-1: this case tests the discovery metadata shape, not auth; it used
+    // localhost-open as a convenience. Opt in so ambient auth passes.
+    process.env.DASHBOARD_ALLOW_NO_AUTH = '1';
 
     const res = fakeRes();
     await handleDashboardApi(

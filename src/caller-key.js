@@ -5,6 +5,16 @@ function sha256Hex(value) {
   return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
+// A body field only carries a usable scope signal when it's a string with
+// non-whitespace content. An empty/whitespace value must NOT mint a scope:
+// user:"" would otherwise hash to the constant sha256("") prefix
+// (e3b0c44298fc1c14...), collapsing every distinct end user of a shared key
+// into one :user: segment and re-enabling cross-tenant cascade/cache bleed.
+// Returns '' for anything that isn't a non-empty trimmed string.
+function usableSignal(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value : '';
+}
+
 // Extract a per-user / per-session signal from the request body so two
 // different end users sharing one API key get different conversation pool
 // scopes. v2.0.25 HIGH-3: chat & responses now look at body.user /
@@ -20,12 +30,13 @@ function sha256Hex(value) {
 // pinned to (apiKey, user/session). Returns '' when no usable signal.
 export function extractBodyCallerSubKey(body) {
   if (!body || typeof body !== 'object') return '';
-  if (typeof body.user === 'string') return sha256Hex(body.user).slice(0, 16);
+  const user = usableSignal(body.user);
+  if (user) return sha256Hex(user).slice(0, 16);
   const candidates = [
-    typeof body?.metadata?.conversation_id === 'string' ? body.metadata.conversation_id : '',
-    typeof body.conversation === 'string' ? body.conversation : '',
-    typeof body.previous_response_id === 'string' ? body.previous_response_id : '',
-    typeof body?.metadata?.session_id === 'string' ? body.metadata.session_id : '',
+    usableSignal(body?.metadata?.conversation_id),
+    usableSignal(body.conversation),
+    usableSignal(body.previous_response_id),
+    usableSignal(body?.metadata?.session_id),
   ].filter(Boolean);
   if (!candidates.length) return '';
   return sha256Hex(candidates.join('|')).slice(0, 16);
@@ -52,11 +63,34 @@ export function extractBodyCallerSubKey(body) {
 // else gets a non-spoofable fingerprint by default.
 const TRUST_PROXY_XFF = process.env.TRUST_PROXY_X_FORWARDED_FOR === '1';
 
+// XFF-1 (audit P1): the LEFTMOST X-Forwarded-For value is fully attacker-
+// controllable — a client just prepends any IP and it lands at the front of
+// the list. Trusted reverse proxies (nginx `$proxy_add_x_forwarded_for`,
+// Cloudflare, etc.) APPEND the peer they received the connection from to the
+// RIGHT, so the trustworthy client IP is counted from the right by the number
+// of trusted proxy hops in front of us (TRUST_PROXY_HOPS, default 1 = a single
+// proxy). Taking the leftmost let an attacker with the shared key rotate the
+// value on every request to dodge the brute-force lockout (each spoof lands in
+// a fresh bucket, never reaching the 5-strike threshold) or aim a chosen IP to
+// land in — and poison — another caller's cascade/cache bucket.
+function trustedProxyHops() {
+  const raw = Number(process.env.TRUST_PROXY_HOPS);
+  return Number.isInteger(raw) && raw >= 1 ? raw : 1;
+}
+
 function clientIp(req) {
   const remote = req?.socket?.remoteAddress || req?.connection?.remoteAddress || '';
   if (!TRUST_PROXY_XFF) return remote;
-  const fwd = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
-  return fwd || remote;
+  const parts = String(req?.headers?.['x-forwarded-for'] || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (!parts.length) return remote;
+  // The last `hops` entries were appended by our trusted proxy chain; the real
+  // client IP is the entry just before them. If the header is shorter than the
+  // configured hop count it can't be trusted — fall back to the socket peer.
+  const idx = parts.length - trustedProxyHops();
+  return (idx >= 0 ? parts[idx] : '') || remote;
 }
 
 function ipUaFingerprint(req) {
@@ -68,7 +102,7 @@ function ipUaFingerprint(req) {
 
 export function callerKeyFromRequest(req, apiKey = '', body = null) {
   const bodySubKey = body ? extractBodyCallerSubKey(body) : '';
-  const hasUserInBody = !!(body && typeof body.user === 'string');
+  const hasUserInBody = !!(body && usableSignal(body.user));
   // Don't log the raw body.user — OpenAI's `user` field is often an end-user
   // email or stable account id (PII). bodySubKey is already its hash.
   log.info('[caller-key] hasUser=%s subKey=%s', hasUserInBody ? 'yes' : 'no', bodySubKey || '(none)');

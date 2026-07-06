@@ -30,6 +30,9 @@ export const BACKEND = Object.freeze({
                              // transport the Devin CLI (chisel) uses. Not Cascade: it
                              // survives the Cascade decommission. Flag-gated via
                              // WINDSURFAPI_GETCHATMESSAGE_TOOLS=1.
+  DEVIN_CONNECT: 'devin-connect', // Direct cloud GetChatMessage over pure HTTP
+                                  // (no local CLI) → server.codeium.com. See
+                                  // src/devin-connect.js + devin-connect-openai.js.
 });
 
 /**
@@ -91,6 +94,24 @@ function getChatMessageAllEnabled(env = process.env) {
 }
 
 /**
+ * DEVIN_CONNECT kill-switch. When set, every request is served by the direct
+ * cloud GetChatMessage path (src/devin-connect.js) — pure HTTP to
+ * server.codeium.com with NO local Devin CLI subprocess. This is the deploy
+ * mode for hosts that have the Windsurf session token but can't (or shouldn't)
+ * run the CLI. Defaults OFF.
+ *
+ * Wins over DEVIN_ONLY (CLI) and all model-based routing: when an operator opts
+ * into the pure-HTTP egress they mean it for the whole process. The model name
+ * still flows through unchanged so devin-connect maps it to the upstream
+ * selector (field #21). Verified working on a free account with swe-1-6-* (see
+ * memory: devin-connect-WORKING-recipe-2026-06-30); claude-* selectors are
+ * gated on a paid-account probe.
+ */
+function devinConnectEnabled(env = process.env) {
+  return String(env.DEVIN_CONNECT || '').trim() === '1';
+}
+
+/**
  * Select the backend for a request. Pure function — no I/O, no mutation.
  *
  * @param {object} params
@@ -98,12 +119,14 @@ function getChatMessageAllEnabled(env = process.env) {
  * @param {Array|null}  [params.tools]    request tools[] (native transport input)
  * @param {boolean}     [params.modelSupportsTools] catalog supports_tool_calls
  * @param {object} [params.env]           env source (injectable for tests)
- * @returns {{ backend: string, reason: string, flow: 'special_agent'|'cascade'|'legacy'|'getchatmessage' }}
+ * @returns {{ backend: string, reason: string, flow: 'special_agent'|'cascade'|'legacy'|'getchatmessage'|'devin_connect' }}
  */
 export function selectBackend({ modelInfo = null, tools = null, modelSupportsTools = false, env = process.env } = {}) {
-  // Native GetChatMessage wins over everything INCLUDING DEVIN_ONLY: it is not
-  // Cascade (survives the decommission) and it does true model selection —
-  // exactly what DEVIN_ONLY's ACP path cannot do (see known-gap note below).
+  // Native GetChatMessage wins over everything INCLUDING DEVIN_ONLY and
+  // DEVIN_CONNECT: it is not Cascade (survives the decommission), it does true
+  // model selection, and it is the transport live traffic runs on today. Both
+  // gates are explicit opt-in flags; when both are set the more specific
+  // per-request gate (tools/model aware) beats the process-wide kill-switch.
   if (getChatMessageToolsEnabled(env)
     && modelSupportsTools
     && ((Array.isArray(tools) && tools.length > 0) || getChatMessageAllEnabled(env))
@@ -112,6 +135,17 @@ export function selectBackend({ modelInfo = null, tools = null, modelSupportsToo
       backend: BACKEND.GETCHATMESSAGE,
       reason: (Array.isArray(tools) && tools.length > 0) ? 'getchatmessage_tools_flag' : 'getchatmessage_all_flag',
       flow: 'getchatmessage',
+    };
+  }
+
+  // DEVIN_CONNECT: pure-HTTP cloud egress retires both Cascade AND the local
+  // CLI. Wins over DEVIN_ONLY and all model-based routing below — an operator
+  // who flips this wants every request on the direct GetChatMessage path.
+  if (devinConnectEnabled(env)) {
+    return {
+      backend: BACKEND.DEVIN_CONNECT,
+      reason: 'devin_connect',
+      flow: 'devin_connect',
     };
   }
 
@@ -153,4 +187,4 @@ export function usesCascadeFlow(selection) {
   return selection?.flow === 'cascade';
 }
 
-export const __testing = { isSpecialAgentInfo, devinCliMode, devinOnlyEnabled };
+export const __testing = { isSpecialAgentInfo, devinCliMode, devinOnlyEnabled, devinConnectEnabled };

@@ -43,7 +43,7 @@ This release threads three things together so that real clients (Claude Code in 
 
 - `node --test test/*.test.js` 在 Mac 节点 192.168.11.9（Windows EPERM 仍然存在）：251/251 passing。
 - 手动 `node --check` 全 modified .js / .test.js 文件 OK。
-- VPS 154.40.36.22:3888 重启后跑端到端三条 probe（`/v1/chat/completions` 非流 / 流、`/v1/messages` 带 cache_control + tools）全部 200，`/v1/messages` 流式带 tools 的 `tool_use` 块 start → input_json_delta → block_stop 顺序正确。
+- VPS <LAB_HOST>:3888 重启后跑端到端三条 probe（`/v1/chat/completions` 非流 / 流、`/v1/messages` 带 cache_control + tools）全部 200，`/v1/messages` 流式带 tools 的 `tool_use` 块 start → input_json_delta → block_stop 顺序正确。
 
 ### Compatibility
 

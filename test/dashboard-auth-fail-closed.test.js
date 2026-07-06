@@ -15,6 +15,7 @@ import { handleDashboardApi } from '../src/dashboard/api.js';
 const original = {
   apiKey: config.apiKey,
   dashboardPassword: config.dashboardPassword,
+  allowNoAuth: process.env.DASHBOARD_ALLOW_NO_AUTH,
 };
 
 function mkRes() {
@@ -39,6 +40,8 @@ function mkReq(headers = {}) {
 afterEach(() => {
   config.apiKey = original.apiKey;
   config.dashboardPassword = original.dashboardPassword;
+  if (original.allowNoAuth === undefined) delete process.env.DASHBOARD_ALLOW_NO_AUTH;
+  else process.env.DASHBOARD_ALLOW_NO_AUTH = original.allowNoAuth;
   configureBindHost('0.0.0.0');
 });
 
@@ -77,14 +80,24 @@ describe('dashboard checkAuth — fail closed on public bind without password (a
     assert.equal(captured.status, 200, 'localhost bind keeps the convenience fallback');
   });
 
-  it('localhost bind + nothing configured → open (single-user dev)', async () => {
+  it('localhost bind + nothing configured → fail-closed by default; opens only with DASHBOARD_ALLOW_NO_AUTH=1 (AUTH-1)', async () => {
     config.apiKey = '';
     config.dashboardPassword = '';
     configureBindHost('127.0.0.1');
 
-    const { res, captured } = mkRes();
-    await handleDashboardApi('GET', '/config', {}, mkReq({}), res);
-    assert.equal(captured.status, 200, 'localhost dev mode with no creds must remain open');
+    // AUTH-1: default is now fail-closed even on loopback — the old open-local
+    // behaviour let any local process / port-map / SSH forward drive privileged
+    // endpoints unauthenticated.
+    delete process.env.DASHBOARD_ALLOW_NO_AUTH;
+    const closed = mkRes();
+    await handleDashboardApi('GET', '/config', {}, mkReq({}), closed.res);
+    assert.equal(closed.captured.status, 401, 'localhost with no creds must fail closed by default');
+
+    // Opt-in restores the old convenience for single-user dev.
+    process.env.DASHBOARD_ALLOW_NO_AUTH = '1';
+    const open = mkRes();
+    await handleDashboardApi('GET', '/config', {}, mkReq({}), open.res);
+    assert.equal(open.captured.status, 200, 'DASHBOARD_ALLOW_NO_AUTH=1 opts back into open-local dashboard');
   });
 
   it('public bind + nothing configured → fail closed (no API_KEY, no DASHBOARD_PASSWORD)', async () => {

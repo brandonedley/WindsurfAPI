@@ -6,7 +6,7 @@
  */
 
 import { randomUUID } from 'crypto';
-import { handleChatCompletions } from './chat.js';
+import { handleChatCompletions, normalizeOpenAIErrorType } from './chat.js';
 import { log } from '../config.js';
 
 function genResponseId() {
@@ -801,7 +801,9 @@ class ResponsesStreamTranslator {
         ...this.responseBase('failed', this.outputItems.filter(Boolean)),
         error: {
           message: err?.message || 'Upstream stream error',
-          type: err?.type || 'upstream_error',
+          // O10: Responses 是 OpenAI 家族,其错误帧在 server.js 之前就写好 →
+          // 就地归一化内部词到官方 OpenAI type。
+          type: normalizeOpenAIErrorType(err?.type || 'upstream_error', err?.status),
           code: err?.code || null,
         },
       },
@@ -914,7 +916,15 @@ export async function handleResponses(body, deps = {}) {
     return { status: 200, body: chatToResponse(result.body, requestedModel, responseId, genMessageId(), requestedTools) };
   }
 
-  const streamResult = await chatHandler({ ...chatBody, stream: true, __route: 'responses' }, context);
+  // O1: the internal chat stream now omits the trailing usage frame unless the
+  // caller opts in. This translator consumes chunk.usage (→ finalUsage → the
+  // response.completed usage block), so it must opt in regardless of what the
+  // Responses client sent — the Responses API reports usage on its own terminal
+  // event, not via an OpenAI-style stream_options toggle.
+  const streamResult = await chatHandler(
+    { ...chatBody, stream: true, __route: 'responses', stream_options: { ...(chatBody.stream_options || {}), include_usage: true } },
+    context,
+  );
   if (!streamResult.stream) return streamResult;
 
   return {

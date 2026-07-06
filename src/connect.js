@@ -15,14 +15,23 @@
 
 import { gzipSync, gunzipSync } from 'zlib';
 
+// Hard ceiling on any single frame — both the wire length a frame may advertise
+// and the number of bytes a gzip payload may inflate to. Bounding the DECOMPRESSED
+// size (via zlib's maxOutputLength) is what stops a high-ratio "zip bomb" frame from
+// a hijacked/compromised upstream from inflating to gigabytes and OOM-killing the
+// single-process proxy before the resulting error can be caught (audit CONN-1).
+// Same value/rationale as StreamingFrameParser's frame-length guard; mirrors the
+// maxOutputLength pattern already used for PDF flate streams (pdf.js:52).
+export const MAX_FRAME_SIZE = 16 * 1024 * 1024;
+
 // ─── Compression helpers ───────────────────────────────────
 
 export function gzip(buf) { return gzipSync(buf); }
 
-export function gunzip(buf) { return gunzipSync(buf); }
+export function gunzip(buf) { return gunzipSync(buf, { maxOutputLength: MAX_FRAME_SIZE }); }
 
 export function tryGunzip(buf) {
-  try { return gunzipSync(buf); }
+  try { return gunzipSync(buf, { maxOutputLength: MAX_FRAME_SIZE }); }
   catch { return null; }
 }
 
@@ -76,7 +85,7 @@ export function unwrapRequest(body, headers = {}) {
   // HTTP-level content-encoding gzip
   const encoding = headers['content-encoding'] || headers['connect-content-encoding'] || '';
   if (encoding === 'gzip') {
-    buf = gunzipSync(buf);
+    buf = gunzipSync(buf, { maxOutputLength: MAX_FRAME_SIZE });
   }
 
   // Check if it's envelope-wrapped (flags byte + 4-byte length)
@@ -85,7 +94,7 @@ export function unwrapRequest(body, headers = {}) {
     const len = buf.readUInt32BE(1);
     if (len === buf.length - 5 && (flags === 0 || flags === 1)) {
       let payload = buf.subarray(5);
-      if (flags & 0x01) payload = gunzipSync(payload);
+      if (flags & 0x01) payload = gunzipSync(payload, { maxOutputLength: MAX_FRAME_SIZE });
       return payload;
     }
   }
@@ -111,7 +120,6 @@ export class StreamingFrameParser {
   drain() {
     // Guard against malformed upstream frames that advertise absurd lengths —
     // without this, Buffer.concat() will happily try to allocate gigabytes.
-    const MAX_FRAME_SIZE = 16 * 1024 * 1024;
     const frames = [];
     while (this.buffer.length >= 5) {
       const len = this.buffer.readUInt32BE(1);
@@ -123,7 +131,12 @@ export class StreamingFrameParser {
       const flags = this.buffer[0];
       let payload = this.buffer.subarray(5, 5 + len);
       if (flags & 0x01) {
-        try { payload = gunzipSync(payload); }
+        // Bound the DECOMPRESSED size too: a high-ratio gzip frame that passes the
+        // ≤16MB wire-length check above can still inflate to gigabytes. Without
+        // maxOutputLength, gunzipSync accumulates up to kMaxLength (~2GB) and on a
+        // memory-constrained host the OOM-killer can reap the process before the
+        // throw below is caught (audit CONN-1).
+        try { payload = gunzipSync(payload, { maxOutputLength: MAX_FRAME_SIZE }); }
         catch (err) {
           // Don't silently drop a frame whose body we couldn't decompress —
           // upstream is sending something we don't understand and the caller

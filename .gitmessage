@@ -1,0 +1,13 @@
+# type(scope): short imperative summary — no trailing period, ≤ ~72 chars
+#
+# Body (optional; required for non-trivial changes). Blank line above.
+#   - file: what changed (why / trace tag: PNG-1, R2, #192)
+#   - regression tests for X
+#
+# ── rules ─────────────────────────────────────────────────────────────
+# type: feat | fix | refactor | perf | docs | test | chore | ci | revert
+# scope: the module(s) touched, e.g. (auth,server) — optional, encouraged
+# subject: lowercase, imperative ("add" not "added"); join with — , list with +
+# NO debug: commits. NO AI/assistant attribution trailer (Co-Authored-By etc).
+# One commit = one concern. Title = what; body = why (diff shows how).
+# See CONTRIBUTING.md → Commits & PRs.

@@ -10,6 +10,7 @@ import { setRuntimeApiKey, setRuntimeDashboardPassword } from '../src/runtime-co
 
 const originalDashboardPassword = config.dashboardPassword;
 const originalApiKey = config.apiKey;
+const originalAllowNoAuth = process.env.DASHBOARD_ALLOW_NO_AUTH;
 let tempDir = null;
 
 afterEach(() => {
@@ -18,6 +19,11 @@ afterEach(() => {
   setRuntimeDashboardPassword('');
   config.dashboardPassword = originalDashboardPassword;
   config.apiKey = originalApiKey;
+  if (originalAllowNoAuth === undefined) {
+    delete process.env.DASHBOARD_ALLOW_NO_AUTH;
+  } else {
+    process.env.DASHBOARD_ALLOW_NO_AUTH = originalAllowNoAuth;
+  }
   configureBindHost('0.0.0.0');
   if (tempDir) {
     rmSync(tempDir, { recursive: true, force: true });
@@ -84,6 +90,11 @@ describe('Docker self-update unavailable state', () => {
     config.apiKey = '';
     setRuntimeApiKey('');
     setRuntimeDashboardPassword('');
+    // This case exercises the self-update availability path, not auth.
+    // AUTH-1 flipped localhost + no-secret to fail-closed; opt back into
+    // the legacy open-local convenience so the availability assertions
+    // below remain the thing under test.
+    process.env.DASHBOARD_ALLOW_NO_AUTH = '1';
     configureBindHost('127.0.0.1');
     setGitExecFileForTest((file, args, opts, cb) => {
       const err = new Error('spawn git ENOENT');

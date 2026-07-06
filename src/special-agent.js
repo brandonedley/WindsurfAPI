@@ -25,7 +25,8 @@ import {
 import { config, log } from './config.js';
 import { recordRequest } from './dashboard/stats.js';
 import { sanitizeText, PathSanitizeStream } from './sanitize.js';
-import { runDevinAcpProcess } from './devin-acp.js';
+import { runDevinAcpProcess, probeDevinCliAvailable } from './devin-acp.js';
+import { systemFingerprint } from './system-fingerprint.js';
 
 const SPECIAL_BACKEND = 'special_agent';
 const DEFAULT_SPECIAL_MODELS = new Set([
@@ -465,6 +466,7 @@ function chatCompletionBody({ id, created, model, messages, text, reasoning = ''
     object: 'chat.completion',
     created,
     model,
+    system_fingerprint: systemFingerprint(model),
     choices: [{
       index: 0,
       message,
@@ -474,13 +476,15 @@ function chatCompletionBody({ id, created, model, messages, text, reasoning = ''
   };
 }
 
-function streamFromText({ id, created, model, messages, text, reasoning = '', usage = null, stopReason = null }) {
+function streamFromText({ id, created, model, messages, text, reasoning = '', usage = null, stopReason = null, includeUsage = false }) {
   return {
     status: 200,
     stream: true,
     headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
     handler: async (res) => {
+      const fp = systemFingerprint(model);
       const send = data => {
+        if (data && data.object === 'chat.completion.chunk' && data.system_fingerprint == null) data.system_fingerprint = fp;
         if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
       };
       send({ id, object: 'chat.completion.chunk', created, model,
@@ -495,8 +499,12 @@ function streamFromText({ id, created, model, messages, text, reasoning = '', us
       }
       send({ id, object: 'chat.completion.chunk', created, model,
         choices: [{ index: 0, delta: {}, finish_reason: mapFinishReason(stopReason) }] });
-      send({ id, object: 'chat.completion.chunk', created, model,
-        choices: [], usage: pickUsage(usage, messages, text) });
+      // O1: trailing usage frame only when the caller opted in via
+      // stream_options.include_usage (OpenAI omits it by default).
+      if (includeUsage) {
+        send({ id, object: 'chat.completion.chunk', created, model,
+          choices: [], usage: pickUsage(usage, messages, text) });
+      }
       if (!res.writableEnded) {
         res.write('data: [DONE]\n\n');
         res.end();
@@ -515,13 +523,17 @@ function streamFromText({ id, created, model, messages, text, reasoning = '', us
  * literal can leak across a chunk boundary. Reasoning chunks are forwarded as
  * reasoning_content only when explicitly opted in.
  */
-function streamLiveAcp({ id, created, model, messages, prompt, modelKey, acct, runner, signal, onDone }) {
+function streamLiveAcp({ id, created, model, messages, prompt, modelKey, acct, runner, signal, onDone, includeUsage = false }) {
   return {
     status: 200,
     stream: true,
     headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' },
     handler: async (res) => {
-      const send = data => { if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`); };
+      const fp = systemFingerprint(model);
+      const send = data => {
+        if (data && data.object === 'chat.completion.chunk' && data.system_fingerprint == null) data.system_fingerprint = fp;
+        if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+      };
       const msgSanitizer = new PathSanitizeStream();
       const showReasoning = exposeReasoning();
       let emittedText = '';
@@ -600,8 +612,11 @@ function streamLiveAcp({ id, created, model, messages, prompt, modelKey, acct, r
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: {}, finish_reason: mapFinishReason(result?.stopReason) }] });
         // H3: bill real ACP usage when the runner reported it; estimate otherwise.
-        send({ id, object: 'chat.completion.chunk', created, model,
-          choices: [], usage: pickUsage(result?.usage, messages, emittedText) });
+        // O1: only forward the usage frame when the caller opted in.
+        if (includeUsage) {
+          send({ id, object: 'chat.completion.chunk', created, model,
+            choices: [], usage: pickUsage(result?.usage, messages, emittedText) });
+        }
       } catch (err) {
         ok = false;
         runErr = err;
@@ -647,11 +662,26 @@ async function checkoutAccount(callerKey, modelKey = null) {
 function reportRunFailure(apiKey, err, deps = {}) {
   if (!apiKey) return;
   const status = Number(err?.status) || 0;
+  const type = String(err?.type || '');
   const message = String(err?.message || '');
   const banSignal = deps.reportBanSignal || reportBanSignal;
   const rateLimited = deps.markRateLimited || markRateLimited;
   const internalError = deps.reportInternalError || reportInternalError;
   const genericError = deps.reportError || reportError;
+  // AC1 gap-c: a 503 backend_unavailable means the Devin CLI binary is missing
+  // or not executable — an ENVIRONMENT fault, not an account fault. It must NOT
+  // feed the windowed generic-error streak, or a missing/removed CLI would
+  // wrongly disable every healthy account it touches (3 hits → status='error').
+  // The proactive probe normally catches this before checkout, but the passive
+  // post-spawn ENOENT→503 (probe disabled, print mode, or a TOCTOU race where
+  // the binary vanishes between probe and spawn) still lands here, so guard it.
+  if (status === 503 || type === 'backend_unavailable') {
+    return;
+  }
+  // A client abort (499 request_aborted) is also not an upstream/account fault.
+  if (status === 499 || type === 'request_aborted') {
+    return;
+  }
   // Account-level ban/suspension shapes — promote to banned after 2 hits.
   if (looksLikeBanSignal(message)) {
     banSignal(apiKey, message);
@@ -685,6 +715,9 @@ export async function handleSpecialAgentChatCompletion(body, route, deps = {}) {
   const id = route?.id || 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 29);
   const created = route?.created || Math.floor(Date.now() / 1000);
   const tools = Array.isArray(body?.tools) ? body.tools : [];
+  // O1: OpenAI streams the trailing usage-only frame only when the caller sets
+  // stream_options.include_usage:true; otherwise it is omitted.
+  const includeUsage = body?.stream_options?.include_usage === true;
 
   if (!configuredBackend()) {
     return errorResponse(
@@ -719,6 +752,28 @@ export async function handleSpecialAgentChatCompletion(body, route, deps = {}) {
   let acct = null;
   let handedOff = false;
   try {
+    const mode = String(process.env.DEVIN_CLI_MODE || 'print').trim().toLowerCase();
+    // AC1 gap-e: proactively confirm the Devin CLI is runnable BEFORE we reserve
+    // a pool account / spawn the ACP child. A missing or non-executable binary
+    // is an ENVIRONMENT fault, not an account fault, so failing fast here avoids
+    // burning a checkout + RPM slot only to hit ENOENT post-spawn. The probe is
+    // zero-billable (devin --version only) and short-TTL cached. ACP-only:
+    // print mode keeps its own post-spawn ENOENT→503.
+    if (mode === 'acp') {
+      const probe = deps.probeDevinCliAvailable || probeDevinCliAvailable;
+      const status = await probe();
+      if (status && status.available === false) {
+        // 503 backend_unavailable — same shape the post-spawn ENOENT path emits,
+        // so the upper layer (failover / client) handles it identically. The
+        // pool is untouched because no account was checked out.
+        return errorResponse(
+          503,
+          'backend_unavailable',
+          `Devin CLI is not available for ACP routing (${status.reason || 'unavailable'}). Install the CLI or set DEVIN_CLI_PATH.`,
+          { backend: 'devin-cli', probe_reason: status.reason || 'unavailable' },
+        );
+      }
+    }
     if (process.env.DEVIN_CLI_USE_ACCOUNT_POOL !== '0') {
       const checkout = deps.checkoutAccount || checkoutAccount;
       acct = await checkout(route?.callerKey || '', modelKey);
@@ -726,7 +781,6 @@ export async function handleSpecialAgentChatCompletion(body, route, deps = {}) {
         return errorResponse(503, 'pool_exhausted', 'No active account is available for Devin CLI special-agent backend.');
       }
     }
-    const mode = String(process.env.DEVIN_CLI_MODE || 'print').trim().toLowerCase();
     const runner = mode === 'acp'
       ? (deps.runDevinAcp || runDevinAcp)
       : (deps.runDevinPrint || runDevinPrint);
@@ -739,7 +793,7 @@ export async function handleSpecialAgentChatCompletion(body, route, deps = {}) {
       const releaser = deps.releaseAccount || releaseAccount;
       const onSuccess = deps.reportSuccess || reportSuccess;
       const stream = streamLiveAcp({
-        id, created, model, messages, prompt, modelKey, acct, runner,
+        id, created, model, messages, prompt, modelKey, acct, runner, includeUsage,
         signal: route?.signal || null,
         onDone: (ok, err) => {
           recordRequest(model, ok, Date.now() - started, acct?.id || null);
@@ -775,7 +829,7 @@ export async function handleSpecialAgentChatCompletion(body, route, deps = {}) {
     // (null on print runners → pickUsage/mapFinishReason fall back gracefully).
     const usage = result?.usage || null;
     const stopReason = result?.stopReason || null;
-    if (body?.stream) return streamFromText({ id, created, model, messages, text, reasoning, usage, stopReason });
+    if (body?.stream) return streamFromText({ id, created, model, messages, text, reasoning, usage, stopReason, includeUsage });
     return { status: 200, body: chatCompletionBody({ id, created, model, messages, text, reasoning, usage, stopReason }) };
   } catch (err) {
     const status = err?.status || 502;

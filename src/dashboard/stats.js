@@ -9,6 +9,74 @@ import { config } from '../config.js';
 
 const STATS_FILE = join(config.dataDir, 'stats.json');
 
+// v2.0.9x — cardinality bound for per-model stats. modelCounts is keyed by
+// the client-controlled model string; without a cap, case-permuted names or
+// free-tier passthrough names grow RAM + stats.json + the per-poll sort
+// unbounded. Cap the number of *real* model keys (LRU-evict the
+// least-recently-updated one into a shared '(other)' bucket so totals still
+// reconcile). Secure default is bounded; set STATS_MAX_MODELS=0 to opt back
+// into the old unbounded behavior.
+const OTHER_MODEL_KEY = '(other)';
+const MAX_MODELS = (() => {
+  const raw = parseInt(process.env.STATS_MAX_MODELS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 500;
+})();
+
+// Monotonic recency counter for LRU eviction. Wall-clock time ties within a
+// single millisecond (many requests can land there), which would make
+// eviction fall back to insertion order and starve hot-but-old keys; a
+// strictly-increasing seq gives an unambiguous least-recently-updated pick.
+let _touchSeq = 0;
+
+/** Count of tracked model keys excluding the shared overflow bucket. */
+function realModelKeyCount() {
+  let n = 0;
+  for (const k of Object.keys(_state.modelCounts)) {
+    if (k !== OTHER_MODEL_KEY) n++;
+  }
+  return n;
+}
+
+/** Fold an evicted model's counts into the shared '(other)' bucket. */
+function foldIntoOther(src) {
+  let dst = _state.modelCounts[OTHER_MODEL_KEY];
+  if (!dst) {
+    dst = { requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [], lastTs: 0 };
+    _state.modelCounts[OTHER_MODEL_KEY] = dst;
+  }
+  dst.requests += src.requests || 0;
+  dst.success += src.success || 0;
+  dst.errors += src.errors || 0;
+  dst.totalMs += src.totalMs || 0;
+  if (!dst.recentMs) dst.recentMs = [];
+  if (Array.isArray(src.recentMs) && src.recentMs.length) {
+    for (const v of src.recentMs) dst.recentMs.push(v);
+    if (dst.recentMs.length > 200) dst.recentMs = dst.recentMs.slice(-200);
+  }
+  dst.lastTs = ++_touchSeq;
+}
+
+/**
+ * Ensure there is room for one more real model key, LRU-evicting the
+ * least-recently-updated real model into '(other)' while over the cap.
+ * No-op when MAX_MODELS is 0 (unbounded).
+ */
+function enforceModelCap() {
+  if (MAX_MODELS <= 0) return;
+  while (realModelKeyCount() >= MAX_MODELS) {
+    let coldestKey = null;
+    let coldestTs = Infinity;
+    for (const [k, s] of Object.entries(_state.modelCounts)) {
+      if (k === OTHER_MODEL_KEY) continue;
+      const ts = s.lastTs || 0;
+      if (ts < coldestTs) { coldestTs = ts; coldestKey = k; }
+    }
+    if (coldestKey == null) break;
+    foldIntoOther(_state.modelCounts[coldestKey]);
+    delete _state.modelCounts[coldestKey];
+  }
+}
+
 const _state = {
   startedAt: Date.now(),
   totalRequests: 0,
@@ -39,6 +107,11 @@ try {
   if (existsSync(STATS_FILE)) {
     const saved = JSON.parse(readFileSync(STATS_FILE, 'utf-8'));
     Object.assign(_state, saved);
+    // Reseed the recency counter above any persisted lastTs so LRU ordering
+    // survives a restart without an early wrap-collision.
+    for (const s of Object.values(_state.modelCounts || {})) {
+      if (s && s.lastTs > _touchSeq) _touchSeq = s.lastTs;
+    }
   }
 } catch {}
 
@@ -67,15 +140,24 @@ export function recordRequest(model, success, durationMs, accountId) {
   if (success) _state.successCount++;
   else _state.errorCount++;
 
-  // Per-model stats (includes a small ring buffer for p50/p95 latency)
-  if (!_state.modelCounts[model]) {
-    _state.modelCounts[model] = { requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [] };
+  // Per-model stats (includes a small ring buffer for p50/p95 latency).
+  // Cap real-model cardinality: a brand-new key that would exceed the limit
+  // gets folded into the shared '(other)' bucket instead (LRU eviction of the
+  // coldest existing key). Known keys and '(other)' itself always update.
+  let key = model;
+  if (!_state.modelCounts[key] && key !== OTHER_MODEL_KEY) {
+    enforceModelCap();
+    if (MAX_MODELS > 0 && realModelKeyCount() >= MAX_MODELS) key = OTHER_MODEL_KEY;
   }
-  const mc = _state.modelCounts[model];
+  if (!_state.modelCounts[key]) {
+    _state.modelCounts[key] = { requests: 0, success: 0, errors: 0, totalMs: 0, recentMs: [], lastTs: 0 };
+  }
+  const mc = _state.modelCounts[key];
   mc.requests++;
   if (success) mc.success++;
   else mc.errors++;
   mc.totalMs += durationMs;
+  mc.lastTs = ++_touchSeq;
   if (!mc.recentMs) mc.recentMs = [];
   if (durationMs > 0) {
     mc.recentMs.push(durationMs);

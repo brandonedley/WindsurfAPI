@@ -1,4 +1,6 @@
-# 给我点 Star 和 Follow 我就不管你了
+# WindsurfAPI
+
+> 把 Windsurf / Devin 的 100+ AI 模型（Claude、GPT、Gemini、DeepSeek、Kimi、GLM、SWE…）变成 OpenAI / Anthropic / Gemini 三套标准 API。零 npm 运行时依赖。
 
 <p align="center">
   <a href="https://github.com/dwgx/WindsurfAPI/stargazers"><img src="https://img.shields.io/github/stars/dwgx/WindsurfAPI?style=for-the-badge&logo=github&color=f5c518" alt="Stars"></a>&nbsp;
@@ -357,7 +359,7 @@ swe-1.5 / 1.5-fast / 1.6 / 1.6-fast · arena-fast · arena-smart
 
 ## 架构要点
 
-- **零 npm 依赖** 全走 `node:*` 内置 · protobuf 手搓（`src/proto.js`）· 下载即跑
+- **零 npm 依赖** 全走 `node:*` 内置 · protobuf 手搓（`src/proto.js`）· 图片编解码 vendored（`src/vendor/`，BSD-3 jpeg-js + 自研纯-Node PNG 解码）· 下载即跑
 - **账号池 + LS 池** 每个独立 proxy 一个 LS 实例 不混用
 - **NO_TOOL 模式** `planner_mode=3` 关掉 Cascade 内置工具循环，避免 `/tmp/windsurf-workspace/` 路径泄漏
 - **三层 sanitize** LS 内建工具结果过滤 · `<tool_call>` 文本解析 · 输出路径清洗
