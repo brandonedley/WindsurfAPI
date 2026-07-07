@@ -584,11 +584,39 @@ export function buildGetChatMessageRequest({ token, messages, model, sessionId, 
         continue;
       }
     }
-    let text = messageText(msg.content);
-    // Tool turns have no native slot here; fold them into user text so multi-turn
-    // histories that carry tool results still flow through.
+    const text = messageText(msg.content);
+    // Assistant turn carrying tool_calls: emit them natively as repeated #6
+    // ChatToolCall { #1 id, #2 name, #3 arguments_json } on the role=2 message,
+    // instead of dropping them. Same #6 shape as encodeAssistantToolCall (the
+    // vision read tool_call); a turn may carry more than one call, so #6 repeats.
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+      const fields = [writeStringField(1, randomUUID()), writeVarintField(2, SOURCE.ASSISTANT)];
+      if (text) fields.push(writeStringField(3, text));
+      for (const tc of msg.tool_calls) {
+        const fn = tc.function || {};
+        fields.push(writeMessageField(6, Buffer.concat([
+          writeStringField(1, tc.id || ''),
+          writeStringField(2, fn.name || ''),
+          writeStringField(3, fn.arguments || ''),
+        ])));
+      }
+      chatMessages.push(Buffer.concat(fields));
+      continue;
+    }
+    // Tool result turn: emit natively as role=4 (SOURCE.TOOL_RESULT) with the
+    // originating id at #7 — the same wire shape 78000e0 landed for image
+    // tool_results, minus the #10 ImageData. Replaces the text-fold, which made
+    // multi-turn tool loops degrade (the model re-narrated prose instead of
+    // continuing the loop). tool_call_id is echoed verbatim (never normalized).
     if (msg.role === 'tool') {
-      text = `[tool result${msg.tool_call_id ? ` for ${msg.tool_call_id}` : ''}]: ${text}`;
+      const fields = [
+        writeStringField(1, randomUUID()),
+        writeVarintField(2, SOURCE.TOOL_RESULT),
+        writeStringField(3, text),
+      ];
+      if (msg.tool_call_id) fields.push(writeStringField(7, msg.tool_call_id));
+      chatMessages.push(Buffer.concat(fields));
+      continue;
     }
     chatMessages.push(Buffer.concat([
       writeStringField(1, randomUUID()),

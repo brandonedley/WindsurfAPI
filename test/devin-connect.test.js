@@ -149,15 +149,56 @@ describe('buildGetChatMessageRequest', () => {
     assert.deepEqual(sources, [__testing.SOURCE.USER, __testing.SOURCE.ASSISTANT, __testing.SOURCE.USER]);
   });
 
-  it('folds tool turns into user-visible text', () => {
+  it('encodes tool turns natively as role=4 tool_result with #7 tool_call_id (not folded text)', () => {
     const proto = buildGetChatMessageRequest({
       token: TOKEN, model: 'm',
       messages: [{ role: 'tool', tool_call_id: 'call_7', content: '42' }],
     });
     const chat = getAllFields(parseFields(proto), 3).find(f => f.wireType === 2);
-    const text = getField(parseFields(chat.value), 3, 2).value.toString('utf8');
-    assert.match(text, /tool result for call_7/);
-    assert.match(text, /42/);
+    const cm = parseFields(chat.value);
+    assert.equal(getField(cm, 2, 0).value, __testing.SOURCE.TOOL_RESULT, 'source is TOOL_RESULT=4');
+    assert.equal(getField(cm, 7, 2).value.toString('utf8'), 'call_7', 'tool_call_id at #7 verbatim');
+    const text = getField(cm, 3, 2).value.toString('utf8');
+    assert.equal(text, '42', 'raw result text at #3');
+    assert.doesNotMatch(text, /tool result for/, 'no legacy text-fold prose');
+  });
+
+  it('encodes assistant tool_calls natively as repeated #6 ChatToolCall {id,name,args}', () => {
+    const proto = buildGetChatMessageRequest({
+      token: TOKEN, model: 'm',
+      messages: [{
+        role: 'assistant', content: '',
+        tool_calls: [
+          { id: 'call_a', function: { name: 'terminal', arguments: '{"cmd":"ls"}' } },
+          { id: 'call_b', function: { name: 'read', arguments: '{"f":"x"}' } },
+        ],
+      }],
+    });
+    const chat = getAllFields(parseFields(proto), 3).find(f => f.wireType === 2);
+    const cm = parseFields(chat.value);
+    assert.equal(getField(cm, 2, 0).value, __testing.SOURCE.ASSISTANT, 'source is ASSISTANT=2');
+    const calls = getAllFields(cm, 6).filter(f => f.wireType === 2);
+    assert.equal(calls.length, 2, 'one #6 per tool_call');
+    const first = parseFields(calls[0].value);
+    assert.equal(getField(first, 1, 2).value.toString('utf8'), 'call_a', '#6.1 id');
+    assert.equal(getField(first, 2, 2).value.toString('utf8'), 'terminal', '#6.2 name');
+    assert.equal(getField(first, 3, 2).value.toString('utf8'), '{"cmd":"ls"}', '#6.3 arguments_json');
+  });
+
+  it('round-trips a multi-turn tool loop: assistant #6 id === tool result #7', () => {
+    const proto = buildGetChatMessageRequest({
+      token: TOKEN, model: 'm',
+      messages: [
+        { role: 'user', content: 'run it' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_x', function: { name: 'terminal', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'call_x', content: 'done' },
+      ],
+    });
+    const chats = getAllFields(parseFields(proto), 3).filter(f => f.wireType === 2).map(c => parseFields(c.value));
+    const asst = chats.find(cm => getField(cm, 2, 0).value === __testing.SOURCE.ASSISTANT);
+    const toolRes = chats.find(cm => getField(cm, 2, 0).value === __testing.SOURCE.TOOL_RESULT);
+    const callId = getField(parseFields(getAllFields(asst, 6)[0].value), 1, 2).value.toString('utf8');
+    assert.equal(callId, getField(toolRes, 7, 2).value.toString('utf8'), 'assistant #6 id links to tool #7');
   });
 
   it('concatenates multiple system turns', () => {
